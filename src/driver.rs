@@ -77,6 +77,13 @@ pub struct EngineDomainObs {
 pub struct MarketSideObs {
     pub asset: usize,
     pub side: u8,
+    /// The asset's `market_id`, read from `Market::engine.asset.market_id`
+    /// (`percolator-ref/src/v16.rs:3597`). This is the value the engine compares
+    /// each per-account `source_claim_market_id` against in
+    /// `validate_source_credit_shape_with_market` (v16.rs:2177); surfacing it lets
+    /// the v0.1 cross-link oracle compare against the REAL engine value rather
+    /// than any convention.
+    pub market_id: u64,
     pub state: EngineDomainObs,
 }
 
@@ -176,14 +183,19 @@ impl Engine {
             // `market.engine` is the engine slot (`engine_slot()` returns
             // `&self.engine`); both fields are public on the engine slot.
             let slot = &market.engine;
+            // `asset.market_id` is the value the engine cross-checks each
+            // per-account `source_claim_market_id` against (v16.rs:2177).
+            let market_id = slot.asset.market_id.get();
             out.push(MarketSideObs {
                 asset,
                 side: 0,
+                market_id,
                 state: read_source_credit(&slot.source_credit_long),
             });
             out.push(MarketSideObs {
                 asset,
                 side: 1,
+                market_id,
                 state: read_source_credit(&slot.source_credit_short),
             });
         }
