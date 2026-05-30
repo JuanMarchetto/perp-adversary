@@ -34,7 +34,7 @@ This is a **conformance signal**, not a proof of correctness. It means: across t
 
 ### Scope and honest limits
 
-- **One invariant, per-account scope.** O1 covers the per-account source-domain relationships. It does **not** check the outer link `source_claim_bound_num ≤ positive_claim_bound_num`, which compares against market-engine `SourceCreditStateV16` state the per-account observation does not carry (documented in `src/oracles.rs`). A market-engine oracle is the natural next step.
+- **Two oracles.** O1 covers the per-account source-domain relationships (`src/v16.rs:3060`). The **v0.1 market-engine cross-link** oracle (`check_observation_market`) adds the outer realizability link `source_claim_bound_num ≤ positive_claim_bound_num` (per-account vs market-engine `positive_claim_bound_num`) plus the `market_id` binding — mirroring the engine's *composing* validator (`src/v16.rs:2143-2253`), i.e. the one relationship neither single-state validator enforces in isolation. (Re-checking the market-engine *single-state* validator would be vacuous: `try_to_runtime` runs it before the driver can observe the state, so any observable market-engine state has already passed it.) Both oracles are Kani-proven sound; the engine held both across all campaigns.
 - **The lien precondition is seeded, not price-walked.** By design the authenticated oracle target is immutable after activation (the permissionless crank moves only `effective_price`), so a sustained price move deliberately locks risk-increase — there is no in-band path to draw a lien through a pure price walk. The harness therefore seeds the same precondition the engine's own conformance test seeds and lets the engine draw the lien; the lien-drawing trade, the lien arithmetic, and the validation are all the engine's real code over a state it validates. (If target re-authentication for a live asset is ever exposed in-engine, the same campaign could be driven end-to-end by `Crank`, which is already implemented.)
 - **One attack class.** Realizability only. Liquidation- and ADL-driven campaigns are modeled but not yet adversarially explored.
 - **In-process, `_not_atomic` driving.** The harness calls the engine's building-block operations directly and observes after each; it does not yet exercise full atomic-instruction compositions or on-chain execution.
@@ -44,16 +44,18 @@ This is a **conformance signal**, not a proof of correctness. It means: across t
 ## Run it
 
 ```bash
-cargo test                                   # 22 tests: oracle, driver, runner, JELLY, smoke, anti-vacuity
-cargo test --test anti_vacuity               # the gate proving campaigns reach non-vacuous lien state
-cargo test --test runner                     # the 256-case adversarial property
-cargo kani --harness realizability_is_sound  # the oracle soundness proof (needs `cargo install kani-verifier`)
+cargo test                                               # full suite (oracles, driver, runner, JELLY, smoke, anti-vacuity)
+cargo test --test anti_vacuity                           # gates proving campaigns reach non-vacuous lien + cross-link state
+cargo test --test runner                                 # the 256-case adversarial property
+cargo kani --tests --harness realizability_is_sound      # O1 per-account soundness proof (needs `cargo install kani-verifier`)
+cargo kani --tests --harness market_cross_link_is_sound  # v0.1 market-engine cross-link soundness proof
 cargo run --bin replay -- scenarios/jelly.json
 ```
 
 ## Roadmap
 
-- **v0.1** — a market-engine oracle for the outer realizability link the per-account O1 deliberately scopes out (`source_claim_bound_num ≤ positive_claim_bound_num`, against `Market::engine.source_credit_long/short`), plus more attack classes and a deliberate engine re-pin.
+- **v0.1 (done)** — market-engine **cross-link** oracle (`source_claim_bound_num ≤ positive_claim_bound_num` + `market_id` binding), Kani-proven, wired into the property + JELLY; the engine held.
+- **Next** — more attack classes (liquidation / ADL campaigns), and a deliberate engine re-pin as Percolator advances.
 
 ## License
 

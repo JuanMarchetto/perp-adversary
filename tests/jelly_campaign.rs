@@ -1,5 +1,5 @@
 use perp_adversary::driver::{run, DomainObs};
-use perp_adversary::oracles::check_observation;
+use perp_adversary::oracles::{check_observation, check_observation_market};
 use perp_adversary::scenario::{Action, Scenario};
 
 /// The JELLY archetype: an account accumulates a large positive source-credit
@@ -81,5 +81,14 @@ fn jelly_campaign_never_breaks_realizability() {
     for obs in &trace.observations {
         check_observation(obs)
             .unwrap_or_else(|v| panic!("JELLY broke O1 at step {}: {}", obs.step, v.detail));
+        // v0.1 market-engine realizability cross-link (v16.rs:2177/2186): the
+        // liened per-account positive-claim bound must stay within the market
+        // engine's realizable positive-claim bound for its asset/side.
+        check_observation_market(obs).unwrap_or_else(|v| {
+            panic!(
+                "JELLY broke the market cross-link at step {}: {}",
+                obs.step, v.detail
+            )
+        });
     }
 }

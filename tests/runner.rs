@@ -1,5 +1,5 @@
 use perp_adversary::driver::run;
-use perp_adversary::oracles::check_observation;
+use perp_adversary::oracles::{check_observation, check_observation_market};
 use perp_adversary::runner::{first_violation, OracleFn};
 use perp_adversary::scenario::{Action, Scenario};
 use proptest::prelude::*;
@@ -73,6 +73,16 @@ proptest! {
                 let path = "scenarios/realizability_candidate.json";
                 let _ = std::fs::write(path, serde_json::to_string_pretty(&s).unwrap());
                 panic!("REALIZABILITY CANDIDATE at step {}: {} :: saved {} :: scenario={}",
+                    obs.step, v.detail, path, serde_json::to_string(&s).unwrap());
+            }
+            // v0.1 market-engine realizability CROSS-LINK (v16.rs:2177/2186):
+            // every non-empty per-account domain must agree with the market
+            // engine's source-credit state for its asset/side.
+            if let Err(v) = check_observation_market(obs) {
+                let _ = std::fs::create_dir_all("scenarios");
+                let path = "scenarios/cross_link_candidate.json";
+                let _ = std::fs::write(path, serde_json::to_string_pretty(&s).unwrap());
+                panic!("CROSS-LINK CANDIDATE at step {}: {} :: saved {} :: scenario={}",
                     obs.step, v.detail, path, serde_json::to_string(&s).unwrap());
             }
         }
