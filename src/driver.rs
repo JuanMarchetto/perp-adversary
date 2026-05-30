@@ -50,6 +50,16 @@ pub struct AccountObs {
     pub pnl: i128,
     pub fee_credits: i128,
     pub domains: Vec<DomainObs>,
+    /// The account's `close_progress.quantity_adl_applied_q` ledger value
+    /// (`CloseProgressLedgerV16Account::quantity_adl_applied_q`,
+    /// `percolator-ref/src/v16.rs:11920`), read straight from the engine slot via
+    /// `.get()` exactly as the engine reads it (`v16.rs:2134`). The engine's ADL
+    /// entrypoint advances this to the closed quantity inside
+    /// `advance_close_progress_quantity_adl` (`v16.rs:9533`). Surfacing it on EVERY
+    /// observation (not just the ADL step) lets the v0.3-B accounting oracle
+    /// compare the value BEFORE and AFTER an `ApplyAdl` step — the cross-step delta
+    /// it polices. On a non-ADL state this is `0`.
+    pub quantity_adl_applied_q: u128,
 }
 
 /// Observable MARKET-ENGINE source-credit state, mirroring `SourceCreditStateV16`
@@ -215,6 +225,10 @@ impl Engine {
                 pnl: acct.pnl.get(),
                 fee_credits: acct.fee_credits.get(),
                 domains: doms.iter().map(read_domain).collect(),
+                // The close-progress ledger's applied-ADL quantity, read directly
+                // via `.get()` as the engine does (v16.rs:2134). 0 until an ADL
+                // advances it (v16.rs:9533).
+                quantity_adl_applied_q: acct.close_progress.quantity_adl_applied_q.get(),
             })
             .collect()
     }

@@ -63,7 +63,7 @@
 //! exhausts the model checker's memory). The public [`realizability`] wraps it,
 //! constructing a human-readable [`Violation`] only on the error path.
 
-use crate::driver::{DomainObs, MarketSideObs, Observation};
+use crate::driver::{AccountObs, AdlObs, DomainObs, MarketSideObs, Observation};
 use crate::scenario::Action;
 
 /// `BOUND_SCALE` / `CREDIT_RATE_SCALE` from `percolator-ref/src/lib.rs:25-26`.
@@ -729,4 +729,257 @@ pub fn check_step_insurance_isolation(
     cur: &Observation,
 ) -> Result<(), Violation> {
     liquidation_insurance_isolation(prev, cur)
+}
+
+// ===========================================================================
+// v0.3 — quantity-ADL EXACT-ACCOUNTING oracle
+//
+// This is a CROSS-STEP (delta) oracle, the same class as the v0.2 liquidation
+// insurance-isolation oracle and distinct from the single-state O1 / v0.1 market
+// cross-link. It mirrors the engine's guarantee about how a quantity auto-
+// deleverage is booked into the account's close-progress ledger:
+//
+//   When `apply_quantity_adl_after_residual_for_account_not_atomic`
+//   (`percolator-ref/src/v16.rs:9479`, SHA `71c9032`) deleverages a finalized-
+//   close account's profitable counterparty, it
+//     (1) computes `out.closed_q == close_q` of the leg
+//         (`apply_quantity_adl_after_residual_internal`, `v16.rs:9676`), with
+//         `close_q > 0` required (`v16.rs:9609` rejects a zero close); then
+//     (2) calls `advance_close_progress_quantity_adl(account, out.closed_q)`
+//         (`v16.rs:9510`), which FIRST requires the prior
+//         `ledger.quantity_adl_applied_q == 0` (`v16.rs:9530`, else `LockActive`)
+//         and `out.closed_q != 0` (`v16.rs:9522`, else `NonProgress`), then sets
+//         `ledger.quantity_adl_applied_q = out.closed_q` (`v16.rs:9533`).
+//
+// So across ONE ApplyAdl step the engine guarantees, over the account's
+// `close_progress.quantity_adl_applied_q` ledger value
+// (`CloseProgressLedgerV16Account::quantity_adl_applied_q`, `v16.rs:11920`) the
+// driver surfaces in `AccountObs.quantity_adl_applied_q`:
+//
+//   (E1) EXACT ACCOUNTING: the ledger's applied-ADL quantity rises by EXACTLY
+//        `cur.adl.closed_q` across the step
+//        (`cur_applied == prev_applied + closed_q`)                            ;
+//   (E2) NON-VACUOUS CLOSE: `closed_q > 0` (a real ADL always closes a non-zero
+//        quantity — the engine bound `v16.rs:9609`/`9522`/`9676`)              ;
+//   (E3) LEDGER COHERENCE: the outcome's reported post-ledger value
+//        (`cur.adl.quantity_adl_applied_q`, read by the driver straight from the
+//        same ledger field after the engine advanced it) equals the account's
+//        observed `AccountObs.quantity_adl_applied_q` — the two views of the SAME
+//        engine field must coincide.
+//
+// (E1)+(E2) are the exact-accounting / bound guarantee asked for: the ADL is
+// booked into the ledger neither MORE (over-credited) nor LESS (under-credited)
+// than the quantity it actually closed, and that quantity is strictly positive.
+//
+// ## Why this is NON-VACUOUS (the trap this class must avoid — third time)
+//
+// After an ApplyAdl step the driver runs `validate_shape` +
+// `validate_with_market`, so the post-ADL state has ALREADY passed every single-
+// state validator; the seeded finalized-close ledger's residual equation is
+// itself engine-validated. Re-checking any single state — the residual equation,
+// the ledger shape, the leg shape — is therefore VACUOUS. The value here is the
+// DELTA: `quantity_adl_applied_q` is a running ledger total; only by comparing its
+// value BEFORE the ADL (the `SeedFinalizedClose` predecessor, where it is 0) and
+// AFTER it, against the step's `closed_q`, can exact accounting be observed. No
+// single observed state encodes "this step booked exactly `closed_q` of applied
+// ADL into the ledger". The `adl_campaign` reaches an engine-accepted state where
+// `closed_q == POS_SCALE` and the ledger advances 0 -> POS_SCALE, so the oracle is
+// exercised non-trivially (see `tests/adl.rs`).
+//
+// ## Fail-closed
+//
+// Pure, no `unsafe`. If `prev` has no account at the ADL's `account` index (we
+// cannot read the baseline ledger value), or the ledger moved BACKWARD, or the
+// observed account ledger disagrees with the outcome's reported value, or the
+// delta does not equal `closed_q`, or `closed_q == 0`, the oracle returns the
+// WORST case — a violation — so it never UNDERSTATES a breach. The companion Kani
+// proof `adl_accounting_is_sound` proves a cleared step implies (E1)+(E2).
+// ===========================================================================
+
+/// Which ADL exact-accounting relationship was broken. `Copy` and allocation-free
+/// so the soundness proof can reason about the check without modelling string
+/// formatting (same discipline as [`ViolationKind`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AdlAccountingKind {
+    /// (E2) `closed_q == 0` — the engine never books a zero-quantity ADL
+    /// (`v16.rs:9609`/`9522`); an observed outcome claiming one is fail-closed.
+    ClosedQZero,
+    /// (E3) the account's observed `quantity_adl_applied_q` ledger value disagrees
+    /// with the ADL outcome's reported post-ledger value — two views of the SAME
+    /// engine field that must coincide (fail-closed).
+    LedgerOutcomeMismatch,
+    /// (E1) the ledger's `quantity_adl_applied_q` did NOT rise by exactly
+    /// `closed_q` across the step (it moved backward, or the delta over/under the
+    /// closed quantity): the ADL is mis-accounted in the ledger.
+    AppliedDeltaNotClosedQ,
+    /// `prev` has no account at the ADL's account index, so the baseline ledger
+    /// value cannot be read and the delta cannot be certified (fail-closed).
+    MissingPrevAccount,
+}
+
+impl AdlAccountingKind {
+    /// The engine citation this breaks.
+    pub fn requirement(self) -> &'static str {
+        match self {
+            AdlAccountingKind::ClosedQZero => "ADL accounting (v16.rs:9609)",
+            AdlAccountingKind::LedgerOutcomeMismatch => "ADL accounting (v16.rs:9533)",
+            AdlAccountingKind::AppliedDeltaNotClosedQ => "ADL accounting (v16.rs:9533)",
+            AdlAccountingKind::MissingPrevAccount => "ADL accounting (v16.rs:9530)",
+        }
+    }
+}
+
+/// ADL exact-accounting arithmetic core: allocation-free, pure, fail-closed. Given
+/// the pre-step baseline ledger value `prev_applied_q` (the account's
+/// `quantity_adl_applied_q` BEFORE the ADL), the post-step account ledger value
+/// `cur_applied_q` (AFTER), and the ADL outcome `adl`, returns `Ok(())` iff
+/// invariants (E1)-(E3) above hold, else the first [`AdlAccountingKind`].
+///
+/// This is the function the Kani soundness proof verifies. It reasons only about
+/// the three `u128` ledger/outcome quantities — no `format!`, no allocation —
+/// exactly as the O1 / cross-link / isolation cores do.
+#[inline]
+pub fn adl_accounting_kind(
+    prev_applied_q: u128,
+    cur_applied_q: u128,
+    adl: &AdlObs,
+) -> Result<(), AdlAccountingKind> {
+    // (E2) a real ADL always closes a strictly positive quantity (v16.rs:9609 /
+    // 9522 reject a zero close); fail closed on a zero-close outcome.
+    if adl.closed_q == 0 {
+        return Err(AdlAccountingKind::ClosedQZero);
+    }
+    // (E3) the account's observed ledger value and the outcome's reported
+    // post-ledger value are the SAME engine field (v16.rs:9533 set it, the driver
+    // read it twice); they must coincide. Fail closed otherwise.
+    if cur_applied_q != adl.quantity_adl_applied_q {
+        return Err(AdlAccountingKind::LedgerOutcomeMismatch);
+    }
+    // (E1) EXACT ACCOUNTING: the ledger rose by EXACTLY closed_q across the step.
+    // Fail-closed via checked arithmetic: a backward move (overflow on the
+    // subtraction) or a delta != closed_q is a violation. We compare the delta
+    // rather than `prev + closed_q` so an overflow in the addition cannot mask a
+    // breach.
+    match cur_applied_q.checked_sub(prev_applied_q) {
+        Some(delta) if delta == adl.closed_q => {}
+        _ => return Err(AdlAccountingKind::AppliedDeltaNotClosedQ),
+    }
+    Ok(())
+}
+
+/// v0.3 quantity-ADL EXACT-ACCOUNTING oracle: for a step whose `cur.adl` is `Some`,
+/// check that the account's `close_progress.quantity_adl_applied_q` ledger value
+/// rose by EXACTLY the outcome's `closed_q` (a strictly positive quantity) across
+/// the ApplyAdl step — exactly the engine's own
+/// `advance_close_progress_quantity_adl` guarantee (`v16.rs:9510-9536`), observed
+/// as a DELTA across the `(prev, cur)` `quantity_adl_applied_q` values.
+///
+/// The acted-on account comes from the step's own `ApplyAdl` action; its baseline
+/// ledger value is read from the matching account in `prev`. Steps that are not a
+/// `cur.adl == Some` ADL are a no-op (the oracle does not apply). Pure and
+/// fail-closed; wraps [`adl_accounting_kind`], adding a human-readable detail
+/// string only on the error path.
+pub fn adl_accounting(prev: &Observation, cur: &Observation) -> Result<(), Violation> {
+    // Only ApplyAdl steps carry an ADL outcome; nothing else advances the ledger
+    // this way, so there is no delta to police.
+    let Some(adl) = cur.adl.as_ref() else {
+        return Ok(());
+    };
+    // The acted-on account comes from the step's own action. (An ADL outcome with a
+    // non-ApplyAdl action is impossible from the driver; fail closed if it ever
+    // occurs rather than certify blindly.)
+    let account = match cur.action {
+        Action::ApplyAdl { account, .. } => account as usize,
+        _ => {
+            return Err(Violation {
+                requirement: AdlAccountingKind::AppliedDeltaNotClosedQ.requirement(),
+                detail: "ADL outcome present on a non-ApplyAdl step; cannot identify the \
+                         acted-on account to certify exact accounting"
+                    .to_string(),
+            })
+        }
+    };
+
+    // Read the pre-step baseline ledger value for THIS account. A missing baseline
+    // cannot be certified -> fail closed.
+    let prev_applied_q = match account_ledger(prev, account) {
+        Some(v) => v,
+        None => {
+            return Err(Violation {
+                requirement: AdlAccountingKind::MissingPrevAccount.requirement(),
+                detail: format!(
+                    "account {account}: no pre-ADL observation of its \
+                     quantity_adl_applied_q baseline; cannot certify the exact-accounting delta"
+                ),
+            })
+        }
+    };
+    // The post-step ledger value for the same account; absent -> fail closed too.
+    let cur_applied_q = match account_ledger(cur, account) {
+        Some(v) => v,
+        None => {
+            return Err(Violation {
+                requirement: AdlAccountingKind::MissingPrevAccount.requirement(),
+                detail: format!(
+                    "account {account}: no post-ADL observation of its \
+                     quantity_adl_applied_q; cannot certify the exact-accounting delta"
+                ),
+            })
+        }
+    };
+
+    adl_accounting_kind(prev_applied_q, cur_applied_q, adl).map_err(|kind| Violation {
+        requirement: kind.requirement(),
+        detail: describe_adl(kind, account, prev_applied_q, cur_applied_q, adl),
+    })
+}
+
+/// The account's observed `quantity_adl_applied_q` ledger value at `index`, or
+/// `None` if no such account exists in the observation (fail-closed signal).
+#[inline]
+fn account_ledger(obs: &Observation, index: usize) -> Option<u128> {
+    obs.accounts
+        .get(index)
+        .map(|a: &AccountObs| a.quantity_adl_applied_q)
+}
+
+/// Build the human-readable detail for an [`AdlAccountingKind`]. Only ever called
+/// on the error path, so its `format!` allocations stay off the model-checked core.
+fn describe_adl(
+    kind: AdlAccountingKind,
+    account: usize,
+    prev_applied_q: u128,
+    cur_applied_q: u128,
+    adl: &AdlObs,
+) -> String {
+    match kind {
+        AdlAccountingKind::ClosedQZero => format!(
+            "account {account}: ADL outcome reports closed_q == 0, but a real ADL closes a \
+             non-zero quantity (v16.rs:9609/9522)"
+        ),
+        AdlAccountingKind::LedgerOutcomeMismatch => format!(
+            "account {account}: observed quantity_adl_applied_q({cur_applied_q}) disagrees with \
+             the ADL outcome's reported post-ledger value({}) — two views of the same engine \
+             field must coincide (v16.rs:9533)",
+            adl.quantity_adl_applied_q
+        ),
+        AdlAccountingKind::AppliedDeltaNotClosedQ => format!(
+            "account {account}: quantity_adl_applied_q moved {prev_applied_q} -> {cur_applied_q} \
+             (delta {}), but the ADL closed_q is {} — the ledger must rise by exactly closed_q \
+             (v16.rs:9533)",
+            cur_applied_q.wrapping_sub(prev_applied_q),
+            adl.closed_q
+        ),
+        AdlAccountingKind::MissingPrevAccount => format!(
+            "account {account}: no pre-ADL baseline for quantity_adl_applied_q; cannot certify \
+             the exact-accounting delta (v16.rs:9530)"
+        ),
+    }
+}
+
+/// Run [`adl_accounting`] over a consecutive `(prev, cur)` observation pair. A thin
+/// convenience over the pair-wise oracle so a cross-step runner can fold it across
+/// a trace's observations.
+pub fn check_step_adl_accounting(prev: &Observation, cur: &Observation) -> Result<(), Violation> {
+    adl_accounting(prev, cur)
 }
