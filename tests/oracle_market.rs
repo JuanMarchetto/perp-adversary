@@ -186,6 +186,7 @@ fn obs_with(domains: Vec<DomainObs>, market_domains: Vec<MarketSideObs>) -> Obse
         }],
         market_domains,
         liquidation: None,
+        adl: None,
     }
 }
 

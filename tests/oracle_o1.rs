@@ -166,6 +166,7 @@ fn obs_with(domains: Vec<DomainObs>) -> Observation {
         }],
         market_domains: Vec::new(),
         liquidation: None,
+        adl: None,
     }
 }
 

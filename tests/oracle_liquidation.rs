@@ -70,6 +70,7 @@ fn obs(market_domains: Vec<MarketSideObs>, liq: Option<(u8, LiquidationObs)>) ->
         accounts: vec![AccountObs::default()],
         market_domains,
         liquidation,
+        adl: None,
     }
 }
 

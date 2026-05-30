@@ -137,6 +137,46 @@ pub enum Action {
         asset: u8,
         close_q: u128,
     },
+    /// Seed `account` into an engine-accepted, FINALIZED-CLOSE, ADL-eligible state
+    /// on `asset`, so a subsequent [`Action::ApplyAdl`] with a real `close_q`
+    /// fires a genuine quantity auto-deleverage.
+    ///
+    /// The engine's ADL entrypoint
+    /// `apply_quantity_adl_after_residual_for_account_not_atomic` (`v16.rs:9479`)
+    /// gates on the account's `close_progress` ledger being
+    /// `active && finalized && residual_remaining == 0`, with
+    /// `domain_side == opposite_side(bankrupt_side)`, plus an ACTIVE, non-stale leg
+    /// on `asset` whose `side == bankrupt_side`. This arm constructs exactly that:
+    /// a residual-equation-satisfying finalized ledger (mirroring the engine's own
+    /// `proof_v16_close_progress_ledger_residual_equation_is_enforced`,
+    /// `tests/proofs_v16.rs:1716`) plus an active `bankrupt_side` leg on `asset`,
+    /// with balanced open-interest / loss-weight / position-count totals so the
+    /// later ADL leaves both sides solvent. The driver then asks the engine to
+    /// VALIDATE the resulting state (`validate_shape` + `validate_with_market`), so
+    /// this is a state the engine itself accepts — not a stub.
+    ///
+    /// `bankrupt_side` is `0 == Long` / `1 == Short`; the deleveraged
+    /// (profitable-counterparty) side is `opposite_side(bankrupt_side)`.
+    SeedFinalizedClose {
+        account: u8,
+        asset: u8,
+        bankrupt_side: u8,
+    },
+    /// Apply a quantity-ADL of `close_q` against `account`'s `bankrupt_side` leg on
+    /// `asset` via the engine's
+    /// `apply_quantity_adl_after_residual_for_account_not_atomic`. Requires the
+    /// state seeded by [`Action::SeedFinalizedClose`]; `close_q` must equal the
+    /// leg's `basis_pos_q.unsigned_abs()` and not exceed either side's
+    /// open interest. The resulting `QuantityAdlOutcomeV16` is captured into the
+    /// [`crate::driver::Observation`].
+    ///
+    /// `bankrupt_side` is `0 == Long` / `1 == Short`.
+    ApplyAdl {
+        account: u8,
+        asset: u8,
+        bankrupt_side: u8,
+        close_q: u128,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -209,6 +249,17 @@ impl Scenario {
                 Ok(())
             }
         };
+        // `bankrupt_side` maps 0 -> Long, 1 -> Short; any other value is invalid.
+        let check_side = |i: usize, s: u8| -> Result<(), ScenarioError> {
+            if s > 1 {
+                Err(ScenarioError {
+                    action_index: Some(i),
+                    detail: format!("bankrupt_side {s} must be 0 (long) or 1 (short)"),
+                })
+            } else {
+                Ok(())
+            }
+        };
         for (i, action) in self.actions.iter().enumerate() {
             match *action {
                 Action::Deposit { account, .. } | Action::Withdraw { account, .. } => {
@@ -247,6 +298,25 @@ impl Scenario {
                 Action::Liquidate { account, asset, .. } => {
                     check_acc(i, account, "")?;
                     check_asset(i, asset, "")?;
+                }
+                Action::SeedFinalizedClose {
+                    account,
+                    asset,
+                    bankrupt_side,
+                } => {
+                    check_acc(i, account, "")?;
+                    check_asset(i, asset, "")?;
+                    check_side(i, bankrupt_side)?;
+                }
+                Action::ApplyAdl {
+                    account,
+                    asset,
+                    bankrupt_side,
+                    ..
+                } => {
+                    check_acc(i, account, "")?;
+                    check_asset(i, asset, "")?;
+                    check_side(i, bankrupt_side)?;
                 }
             }
         }
