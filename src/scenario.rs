@@ -54,6 +54,35 @@ pub enum Action {
         now_slot: u64,
         effective_price: u64,
     },
+    /// Seed `account`'s positive, source-attributed PnL of `claim` (unscaled
+    /// atoms) on `asset`'s long source-credit domain, plus the matching
+    /// counterparty backing in the market — establishing the precondition the
+    /// engine requires before a risk-increasing trade can draw an
+    /// initial-margin source-credit lien.
+    ///
+    /// This mirrors, step for step, the precondition built by the engine's OWN
+    /// conformance test
+    /// `v16_risk_increasing_trade_creates_source_credit_lien_for_im`
+    /// (`tests/v16_spec_tests.rs:580`): the market-side source-credit/backing
+    /// state is established through the engine's PUBLIC entrypoints
+    /// (`add_source_positive_claim_bound_not_atomic`,
+    /// `add_fresh_counterparty_backing_not_atomic`) and the per-account
+    /// PnL/claim is set exactly as the engine's `account_fixture` seeds it. The
+    /// driver then asks the engine to VALIDATE the resulting state, so this is a
+    /// state the engine itself accepts — not a stub.
+    ///
+    /// Why a seed and not a pure price walk: in engine rev `71c9032`,
+    /// `accrue_asset_to_not_atomic` moves `effective_price` but never updates
+    /// `raw_oracle_target_price`, so any price progression leaves a permanent
+    /// target/effective lag that makes `validate_trade_position_preflight`
+    /// reject every risk-increasing trade (`v16.rs:8557`) — the ONLY path that
+    /// creates a lien. The price walk that would create the PnL therefore also
+    /// blocks the lien. See README "v0 result" for the full finding.
+    SeedSourceClaim {
+        account: u8,
+        asset: u8,
+        claim: u128,
+    },
     Liquidate {
         account: u8,
         asset: u8,

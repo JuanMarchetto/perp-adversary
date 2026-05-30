@@ -9,8 +9,12 @@ use percolator::v16::{
     MarketGroupV16HeaderAccount, MarketGroupV16ViewMut, PermissionlessCrankActionV16,
     PermissionlessCrankRequestV16, PortfolioAccountV16Account, PortfolioSourceDomainV16Account,
     PortfolioV16ViewMut, ProvenanceHeaderV16, ProvenanceHeaderV16Account, TradeRequestV16,
-    V16Config, V16Error,
+    V16Config, V16Error, V16PodI128, V16PodU128, V16PodU64,
 };
+
+/// `BOUND_SCALE` from `percolator-ref/src/lib.rs:25`. Claim/backing "num" fields
+/// are amounts scaled by this; `*_effective_reserved` are unscaled atoms.
+const BOUND_SCALE: u128 = 1_000_000_000_000;
 
 /// Per-source-domain observable state, read from a
 /// [`PortfolioSourceDomainV16Account`] via its POD `.get()` accessors.
@@ -258,6 +262,55 @@ fn apply(
             mv.permissionless_crank_not_atomic(&mut av, req)?;
             Ok(())
         }
+        Action::SeedSourceClaim {
+            account,
+            asset,
+            claim,
+        } => {
+            let claim_num = claim
+                .checked_mul(BOUND_SCALE)
+                .ok_or(V16Error::ArithmeticOverflow)?;
+            let domain = (asset as usize) * 2; // long side of `asset`
+                                               // 1. Market-side source-credit claim + backing, via the engine's own
+                                               //    PUBLIC entrypoints (these recompute the credit rate and run the
+                                               //    reservation-encumbrance + shape proofs internally).
+            {
+                let mut mv = MarketGroupV16ViewMut::new(&mut eng.mh, &mut eng.mk);
+                mv.add_source_positive_claim_bound_not_atomic(domain, claim_num, claim_num)?;
+                // expiry must exceed current_slot; current_slot is 0 here.
+                mv.add_fresh_counterparty_backing_not_atomic(domain, claim_num, u64::MAX)?;
+            }
+            // 2. Per-account positive, source-attributed PnL + claim. This is the
+            //    only field-level seed (no public account-claim setter exists);
+            //    it mirrors the engine's own `account_fixture` seeding in
+            //    `v16_risk_increasing_trade_creates_source_credit_lien_for_im`.
+            let acct = &mut eng.accts[account as usize];
+            let claim_i128 = i128::try_from(claim).map_err(|_| V16Error::ArithmeticOverflow)?;
+            acct.pnl = V16PodI128::new(acct.pnl.get().saturating_add(claim_i128));
+            let market_id = eng.mk[asset as usize].engine.asset.market_id.get();
+            let dom = &mut eng.domains[account as usize][domain];
+            dom.source_claim_market_id = V16PodU64::new(market_id);
+            dom.source_claim_bound_num =
+                V16PodU128::new(dom.source_claim_bound_num.get().saturating_add(claim_num));
+            // 3. Group-level positive-PnL totals kept consistent with the claim.
+            eng.mh.pnl_pos_tot = V16PodU128::new(eng.mh.pnl_pos_tot.get().saturating_add(claim));
+            eng.mh.pnl_pos_bound_tot_num =
+                V16PodU128::new(eng.mh.pnl_pos_bound_tot_num.get().saturating_add(claim_num));
+            eng.mh.pnl_pos_bound_tot =
+                V16PodU128::new(eng.mh.pnl_pos_bound_tot.get().saturating_add(claim));
+            // 4. Ask the engine to VALIDATE the resulting account/market state, so
+            //    we only ever observe a state the engine itself accepts.
+            {
+                let mv = MarketGroupV16ViewMut::new(&mut eng.mh, &mut eng.mk);
+                mv.validate_shape()?;
+                let av = PortfolioV16ViewMut::new(
+                    &mut eng.accts[account as usize],
+                    &mut eng.domains[account as usize],
+                );
+                av.validate_with_market(&mv.as_view())?;
+            }
+            Ok(())
+        }
         Action::Liquidate { account, asset } => {
             let mut mv = MarketGroupV16ViewMut::new(&mut eng.mh, &mut eng.mk);
             let mut av = PortfolioV16ViewMut::new(
@@ -282,29 +335,51 @@ fn apply(
 /// source-credit lien, so the O1 oracle's realizability machinery is actually
 /// exercised (see `tests/anti_vacuity.rs`).
 ///
-/// The lien pipeline is: open a position; legitimately progress the asset price
-/// so the open leg books positive PnL attributed to a source domain (this sets
-/// `source_claim_bound_num` ⇒ the account "has source claims"); then perform a
-/// further risk-increasing trade, which makes the engine draw initial-margin
-/// source credit and create the lien
-/// (`create_initial_margin_source_lien_if_needed`, `v16.rs:10260`).
+/// The engine creates a source-credit lien ONLY inside `execute_trade`'s
+/// `create_initial_margin_source_lien_if_needed` (`v16.rs:10260`), and only when
+/// a *risk-increasing* trade is performed by an account that already holds
+/// positive, source-attributed PnL backed by counterparty backing — AND there
+/// is no asset target/effective price lag (`v16.rs:8557` rejects every
+/// risk-increasing trade while a lag exists). In engine rev `71c9032` accrue
+/// never re-authenticates `raw_oracle_target_price`, so a pure price walk that
+/// creates the PnL also creates a permanent lag that blocks the lien-drawing
+/// trade. The legitimate, engine-accepted way to reach the lien state is
+/// therefore to establish the same precondition the engine's OWN conformance
+/// test builds (see [`Action::SeedSourceClaim`]) and then trade at the
+/// no-lag activation price — exactly what
+/// `v16_risk_increasing_trade_creates_source_credit_lien_for_im` does.
 pub fn lien_creating_campaign() -> Scenario {
     use crate::scenario::Action::*;
+    // Market activates at price 100 (see `Engine::new`); trade at 100 ⇒ no lag.
+    // Long opens 1.0 position (notional 100, IM 100 at 100% IM) with ZERO
+    // capital, so the whole IM must be drawn from the seeded source credit ⇒ a
+    // lien of 100 atoms. The seeded claim (100) exactly backs it.
     Scenario {
         n_markets: 1,
         n_accounts: 2,
         actions: vec![
-            Deposit { account: 0, amount: 10_000_000 },
-            Deposit { account: 1, amount: 10_000_000 },
-            // Account 0 opens a long, account 1 the matching short.
-            Trade { long: 0, short: 1, asset: 0, size_q: 1_000_000, exec_price: 100, fee_bps: 0 },
-            // TEMP (vacuity demonstration): walk price via the OLD MovePrice path.
-            MovePrice { asset: 0, now_slot: 1, effective_price: 150 },
-            MovePrice { asset: 0, now_slot: 2, effective_price: 200 },
-            MovePrice { asset: 0, now_slot: 3, effective_price: 250 },
-            // Risk-increasing add while the long now has positive
-            // source-attributed PnL: forces an initial-margin source-credit lien.
-            Trade { long: 0, short: 1, asset: 0, size_q: 1_000_000, exec_price: 250, fee_bps: 0 },
+            // Counterparty funds the short leg of the opening trade.
+            Deposit {
+                account: 1,
+                amount: 1_000_000,
+            },
+            // Establish account 0's positive source-attributed PnL + the
+            // matching counterparty backing on asset 0's long domain.
+            SeedSourceClaim {
+                account: 0,
+                asset: 0,
+                claim: 100,
+            },
+            // Risk-increasing open by the (zero-capital) long: the engine must
+            // draw an initial-margin source-credit lien to meet IM.
+            Trade {
+                long: 0,
+                short: 1,
+                asset: 0,
+                size_q: 1_000_000,
+                exec_price: 100,
+                fee_bps: 0,
+            },
         ],
     }
 }
