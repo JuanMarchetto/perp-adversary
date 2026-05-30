@@ -4,7 +4,7 @@ An adversarial economic conformance harness for Solana perpetual-futures risk en
 
 ## What it does
 
-`perp-adversary` drives a real perps risk engine through **multi-step adversarial campaigns** (matched trades, oracle price walks, margin withdrawal, liquidation across multiple accounts and slots) and checks an engine **economic invariant as a runtime oracle after every step**. When a step breaks the invariant, the failing campaign is reported with a one-command repro.
+`perp-adversary` drives a real perps risk engine through **multi-step adversarial campaigns** (matched trades, position-aware price cranks, source-credit-lien draws, margin withdrawal, liquidation across multiple accounts and slots) and checks an engine **economic invariant as a runtime oracle after every step**. When a step breaks the invariant, the failing campaign is reported with a one-command repro. Campaigns are driven into genuinely populated source-credit-lien state — not the all-zero default where the invariant holds trivially (see "v0 result").
 
 v0 targets [Percolator](https://github.com/aeyakovenko/percolator) at commit `71c9032`. It is an **independent harness that depends on Percolator (Apache-2.0); it does not fork or modify it.** It complements Percolator's existing per-instruction Kani proofs and single-path fuzzing by checking the invariant *across a whole campaign*, which bounded per-function model checking does not express.
 
@@ -18,26 +18,35 @@ The oracle's arithmetic core is **proven sound with Kani** (`realizability_is_so
 
 ## v0 result
 
-Against the pinned engine (`71c9032`), the engine **held source-domain realizability across every campaign tested**:
+Against the pinned engine (`71c9032`), the engine **held source-domain realizability on every campaign — and, critically, those campaigns now reach genuinely populated source-credit-lien state, so the result is not vacuous.**
 
-- a proptest property over **64 randomized** deposit / matched-trade / oracle-price-walk campaigns (two accounts, multiple slots) — no violation;
-- a hand-seeded **JELLY-archetype** campaign (open a position, walk the price up across slots, attempt an oversized extraction) — no violation at any step.
+Reaching that state took engine-faithful work. The O1 relationships hold trivially over an all-zero `DomainObs`, so a campaign only tests the oracle if it drives the engine to draw a **non-zero source-credit lien**. The engine draws one lien, in one place: `execute_trade`'s `create_initial_margin_source_lien_if_needed` (`src/v16.rs:10260`), and only when a **risk-increasing** trade is made by an account that already holds positive, source-attributed PnL backed by counterparty backing. There is a catch in this engine revision: `accrue_asset_to_not_atomic` moves `effective_price` but **never re-authenticates `raw_oracle_target_price`**, so any price progression leaves a permanent target/effective lag, and `validate_trade_position_preflight` (`src/v16.rs:8557`) then **rejects every risk-increasing trade** — the only path that can create a lien. A pure oracle price walk that creates the PnL therefore also blocks the lien that PnL would back. (v0's original JELLY hit exactly this: with an open position, every `MovePrice` step returned `NonProgress` and the price never actually moved.)
 
-This is a **conformance signal**, not a proof of correctness. It means: across the adversarial campaigns this harness drove, the engine never left an accepted observable state that violated its own per-account source-credit lien-aggregate invariant.
+So the harness establishes the lien precondition **the way the engine's own conformance test does** (`v16_risk_increasing_trade_creates_source_credit_lien_for_im`, `tests/v16_spec_tests.rs:580`): a `SeedSourceClaim` action seeds the account's positive source-attributed PnL and the matching counterparty backing — the market side via the engine's **public** `add_source_positive_claim_bound_not_atomic` / `add_fresh_counterparty_backing_not_atomic` entrypoints, the per-account side exactly as the engine's `account_fixture` seeds it — and then asks the engine to **validate** the resulting state. A real risk-increasing trade at the no-lag activation price then makes the engine run its genuine lien-drawing logic. Nothing in the engine is stubbed or weakened.
+
+On the now-populated campaigns the engine **held O1 at every step**:
+
+- a proptest property over **256 randomized** lien-drawing campaigns (random seeded claims × position sizes, two accounts) — every campaign drew a real lien (observed `source_lien_effective_reserved` spanning ~1–200 atoms across the range, the realizability cap and the rejection path both exercised) — **no violation**;
+- a populated **JELLY-archetype** campaign — the account accumulates a source claim, the opening trade draws a lien of 100 atoms, and a second lever attempt is correctly **rejected** (`LockActive`) so the lien stays capped at realizable backing — **no violation at any step**;
+- an **anti-vacuity gate** (`tests/anti_vacuity.rs`) that fails loudly if any future change makes campaigns stop producing a non-zero `source_claim_liened_num` — turning vacuity into a permanent test failure.
+
+This is a **conformance signal**, not a proof of correctness. It means: across the adversarial campaigns this harness drove — including states where the engine had actually drawn source-credit liens — the engine never left an accepted observable state that violated its own per-account source-credit lien-aggregate invariant. No candidate violation appeared; if one ever does, the proptest persists its scenario to `scenarios/realizability_candidate.json` and the run fails loudly (the oracle is never weakened to pass).
 
 ### Scope and honest limits
 
 - **One invariant, per-account scope.** O1 covers the per-account source-domain relationships. It does **not** check the outer link `source_claim_bound_num ≤ positive_claim_bound_num`, which compares against market-engine `SourceCreditStateV16` state the per-account observation does not carry (documented in `src/oracles.rs`). A market-engine oracle is the natural next step.
-- **One attack class.** Realizability / oracle-walk only. Liquidation- and ADL-driven campaigns are modeled but not yet adversarially explored.
+- **The lien precondition is seeded, not price-walked.** Because this engine revision never re-authenticates the oracle target price (above), the harness cannot reach the lien state through a pure price walk; it seeds the same precondition the engine's own test seeds and lets the engine draw the lien. The lien-drawing trade, the lien arithmetic, and the validation are all the engine's real code. An engine revision that re-authenticates the oracle target would let the same campaign be driven end-to-end by `Crank` (the position-aware price-progression action is already implemented and exercised).
+- **One attack class.** Realizability only. Liquidation- and ADL-driven campaigns are modeled but not yet adversarially explored.
 - **In-process, `_not_atomic` driving.** The harness calls the engine's building-block operations directly and observes after each; it does not yet exercise full atomic-instruction compositions or on-chain execution.
-- **Bounded Kani proof**, matching the engine's own proof sizing — not an unbounded u128 proof (intractable for the model checker, as it is for the engine's own proofs).
+- **Bounded Kani proof**, matching the engine's own proof sizing — not an unbounded u128 proof (intractable for the model checker, as it is for the engine's own proofs). The bounded model does not exercise the oracle's overflow fail-closed arms, which only ever add violations, so soundness is unaffected.
 - Pinned to engine SHA `71c9032`; the engine moves fast, so re-pin deliberately.
 
 ## Run it
 
 ```bash
-cargo test                                   # 21 tests: oracle, driver, runner, JELLY, smoke
-cargo test --test runner                     # the 64-case adversarial property
+cargo test                                   # 22 tests: oracle, driver, runner, JELLY, smoke, anti-vacuity
+cargo test --test anti_vacuity               # the gate proving campaigns reach non-vacuous lien state
+cargo test --test runner                     # the 256-case adversarial property
 cargo kani --harness realizability_is_sound  # the oracle soundness proof (needs `cargo install kani-verifier`)
 cargo run --bin replay -- scenarios/jelly.json
 ```
