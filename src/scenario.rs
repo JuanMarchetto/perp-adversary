@@ -2,12 +2,6 @@
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Side {
-    Long = 0,
-    Short = 1,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Action {
     Deposit {
         account: u8,
@@ -94,4 +88,104 @@ pub struct Scenario {
     pub n_markets: u32,
     pub n_accounts: u8,
     pub actions: Vec<Action>,
+}
+
+/// A structural problem with an externally-supplied [`Scenario`] (e.g. an
+/// out-of-range account/asset index). Returned by [`Scenario::validate`] so the
+/// trust boundary for untrusted JSON is explicit and callers can reject rather
+/// than panic deep inside the engine adapter.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScenarioError {
+    pub action_index: Option<usize>,
+    pub detail: String,
+}
+
+impl std::fmt::Display for ScenarioError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.action_index {
+            Some(i) => write!(f, "action {i}: {}", self.detail),
+            None => write!(f, "{}", self.detail),
+        }
+    }
+}
+
+impl std::error::Error for ScenarioError {}
+
+impl Scenario {
+    /// Reject structurally-invalid scenarios up front: every account index must
+    /// be `< n_accounts`, every asset index `< n_markets`, trade legs must be
+    /// distinct, and the dimensions must be non-degenerate. The driver indexes
+    /// its account/market vectors directly, so an out-of-range index from
+    /// untrusted JSON would otherwise panic. Validating here keeps that a
+    /// recoverable error at the trust boundary.
+    pub fn validate(&self) -> Result<(), ScenarioError> {
+        if self.n_accounts == 0 {
+            return Err(ScenarioError {
+                action_index: None,
+                detail: "n_accounts must be >= 1".into(),
+            });
+        }
+        if self.n_markets == 0 {
+            return Err(ScenarioError {
+                action_index: None,
+                detail: "n_markets must be >= 1".into(),
+            });
+        }
+        let n_acc = self.n_accounts;
+        let n_mkt = self.n_markets;
+        let check_acc = |i: usize, a: u8, what: &str| -> Result<(), ScenarioError> {
+            if a as u16 >= n_acc as u16 {
+                Err(ScenarioError {
+                    action_index: Some(i),
+                    detail: format!("{what} account index {a} >= n_accounts {n_acc}"),
+                })
+            } else {
+                Ok(())
+            }
+        };
+        let check_asset = |i: usize, a: u8, what: &str| -> Result<(), ScenarioError> {
+            if (a as u32) >= n_mkt {
+                Err(ScenarioError {
+                    action_index: Some(i),
+                    detail: format!("{what} asset index {a} >= n_markets {n_mkt}"),
+                })
+            } else {
+                Ok(())
+            }
+        };
+        for (i, action) in self.actions.iter().enumerate() {
+            match *action {
+                Action::Deposit { account, .. } | Action::Withdraw { account, .. } => {
+                    check_acc(i, account, "")?;
+                }
+                Action::Trade {
+                    long, short, asset, ..
+                } => {
+                    check_acc(i, long, "long")?;
+                    check_acc(i, short, "short")?;
+                    check_asset(i, asset, "")?;
+                    if long == short {
+                        return Err(ScenarioError {
+                            action_index: Some(i),
+                            detail: format!("trade legs must be distinct accounts (both {long})"),
+                        });
+                    }
+                }
+                Action::MovePrice { asset, .. } => check_asset(i, asset, "")?,
+                Action::Crank { account, asset, .. } => {
+                    check_acc(i, account, "")?;
+                    check_asset(i, asset, "")?;
+                }
+                Action::SeedSourceClaim { account, asset, .. } => {
+                    check_acc(i, account, "")?;
+                    check_asset(i, asset, "")?;
+                }
+                Action::Liquidate { account, asset } => {
+                    check_acc(i, account, "")?;
+                    check_asset(i, asset, "")?;
+                }
+            }
+        }
+        Ok(())
+    }
 }

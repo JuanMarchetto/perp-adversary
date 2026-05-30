@@ -1,4 +1,4 @@
-use perp_adversary::scenario::{Action, Scenario, Side};
+use perp_adversary::scenario::{Action, Scenario};
 
 #[test]
 fn scenario_roundtrips_through_json() {
@@ -32,5 +32,4 @@ fn scenario_roundtrips_through_json() {
     let j = serde_json::to_string(&s).unwrap();
     let back: Scenario = serde_json::from_str(&j).unwrap();
     assert_eq!(s, back);
-    assert_eq!(Side::Long as u8 + Side::Short as u8, 1);
 }

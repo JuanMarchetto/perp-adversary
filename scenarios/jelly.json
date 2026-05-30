@@ -2,11 +2,9 @@
   "n_markets": 1,
   "n_accounts": 2,
   "actions": [
-    { "Deposit": { "account": 0, "amount": 1000000 } },
-    { "Deposit": { "account": 1, "amount": 1000000 } },
-    { "Trade": { "long": 0, "short": 1, "asset": 0, "size_q": 5000, "exec_price": 100, "fee_bps": 0 } },
-    { "MovePrice": { "asset": 0, "now_slot": 1, "effective_price": 140 } },
-    { "MovePrice": { "asset": 0, "now_slot": 2, "effective_price": 180 } },
-    { "Withdraw": { "account": 0, "amount": 900000 } }
+    { "Deposit": { "account": 1, "amount": 10000000 } },
+    { "SeedSourceClaim": { "account": 0, "asset": 0, "claim": 100 } },
+    { "Trade": { "long": 0, "short": 1, "asset": 0, "size_q": 1000000, "exec_price": 100, "fee_bps": 0 } },
+    { "Trade": { "long": 0, "short": 1, "asset": 0, "size_q": 1000000, "exec_price": 100, "fee_bps": 0 } }
   ]
 }

@@ -69,6 +69,13 @@ fn ceil_div_scale(n: u128) -> u128 {
     }
 }
 
+// NOTE: this bounded input model (whole-atom multipliers <= 6, sub-SCALE
+// remainders <= 3, atom counts <= 9) stays far below u128::MAX, so it does NOT
+// exercise the oracle's overflow fail-closed arms (the `checked_add`/`checked_mul`
+// `None` paths in checks 1, 2, 5). That is sound: those arms only ever ADD
+// violations (they return `Err` on un-computable quantities), so they cannot
+// turn an Err into an Ok — the no-false-negative property proved here is
+// unaffected by leaving them un-modelled.
 #[kani::proof]
 fn realizability_is_sound() {
     let eff: u8 = kani::any();
