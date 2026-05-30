@@ -6,9 +6,10 @@
 use crate::scenario::{Action, Scenario};
 use percolator::v16::{
     v16_domain_count_for_market_slots, EngineAssetSlotV16Account, LiquidationRequestV16, Market,
-    MarketGroupV16HeaderAccount, MarketGroupV16ViewMut, PortfolioAccountV16Account,
-    PortfolioSourceDomainV16Account, PortfolioV16ViewMut, ProvenanceHeaderV16,
-    ProvenanceHeaderV16Account, TradeRequestV16, V16Config, V16Error,
+    MarketGroupV16HeaderAccount, MarketGroupV16ViewMut, PermissionlessCrankActionV16,
+    PermissionlessCrankRequestV16, PortfolioAccountV16Account, PortfolioSourceDomainV16Account,
+    PortfolioV16ViewMut, ProvenanceHeaderV16, ProvenanceHeaderV16Account, TradeRequestV16,
+    V16Config, V16Error,
 };
 
 /// Per-source-domain observable state, read from a
@@ -231,6 +232,32 @@ fn apply(
             mv.accrue_asset_to_not_atomic(asset as usize, now_slot, effective_price, 0, false)?;
             Ok(())
         }
+        Action::Crank {
+            account,
+            asset,
+            now_slot,
+            effective_price,
+        } => {
+            let mut mv = MarketGroupV16ViewMut::new(&mut eng.mh, &mut eng.mk);
+            let mut av = PortfolioV16ViewMut::new(
+                &mut eng.accts[account as usize],
+                &mut eng.domains[account as usize],
+            );
+            // The engine's position-aware price-progression path: Refresh first
+            // certifies the account (booking the open leg's favourable K-delta as
+            // source-attributed positive PnL), then `permissionless_crank` computes
+            // `protective_progress` and accrues the asset. This is exactly what the
+            // engine's own fuzz/spec tests do (v16.rs:7974-8021).
+            let req = PermissionlessCrankRequestV16 {
+                now_slot,
+                asset_index: asset as usize,
+                effective_price,
+                funding_rate_e9: 0,
+                action: PermissionlessCrankActionV16::Refresh,
+            };
+            mv.permissionless_crank_not_atomic(&mut av, req)?;
+            Ok(())
+        }
         Action::Liquidate { account, asset } => {
             let mut mv = MarketGroupV16ViewMut::new(&mut eng.mh, &mut eng.mk);
             let mut av = PortfolioV16ViewMut::new(
@@ -248,6 +275,37 @@ fn apply(
             mv.liquidate_account_not_atomic(&mut av, req)?;
             Ok(())
         }
+    }
+}
+
+/// A campaign that drives the engine into a state with a NON-ZERO
+/// source-credit lien, so the O1 oracle's realizability machinery is actually
+/// exercised (see `tests/anti_vacuity.rs`).
+///
+/// The lien pipeline is: open a position; legitimately progress the asset price
+/// so the open leg books positive PnL attributed to a source domain (this sets
+/// `source_claim_bound_num` ⇒ the account "has source claims"); then perform a
+/// further risk-increasing trade, which makes the engine draw initial-margin
+/// source credit and create the lien
+/// (`create_initial_margin_source_lien_if_needed`, `v16.rs:10260`).
+pub fn lien_creating_campaign() -> Scenario {
+    use crate::scenario::Action::*;
+    Scenario {
+        n_markets: 1,
+        n_accounts: 2,
+        actions: vec![
+            Deposit { account: 0, amount: 10_000_000 },
+            Deposit { account: 1, amount: 10_000_000 },
+            // Account 0 opens a long, account 1 the matching short.
+            Trade { long: 0, short: 1, asset: 0, size_q: 1_000_000, exec_price: 100, fee_bps: 0 },
+            // TEMP (vacuity demonstration): walk price via the OLD MovePrice path.
+            MovePrice { asset: 0, now_slot: 1, effective_price: 150 },
+            MovePrice { asset: 0, now_slot: 2, effective_price: 200 },
+            MovePrice { asset: 0, now_slot: 3, effective_price: 250 },
+            // Risk-increasing add while the long now has positive
+            // source-attributed PnL: forces an initial-margin source-credit lien.
+            Trade { long: 0, short: 1, asset: 0, size_q: 1_000_000, exec_price: 250, fee_bps: 0 },
+        ],
     }
 }
 
