@@ -77,9 +77,65 @@ pub enum Action {
         asset: u8,
         claim: u128,
     },
+    /// Seed `account` into an engine-accepted UNDERWATER state on `asset`'s long
+    /// side, so a subsequent [`Action::Liquidate`] with a real `close_q` fires a
+    /// genuine liquidation that books residual loss.
+    ///
+    /// This mirrors, field for field, the underwater state the engine's OWN
+    /// conformance test
+    /// `v16_public_liquidation_on_unfunded_domain_cannot_drain_shared_insurance`
+    /// (`tests/v16_spec_tests.rs:289`) constructs: a single open long leg at
+    /// `POS_SCALE`, negative account PnL, and matching open-interest /
+    /// loss-weight / position-count totals on the asset, with `vault`,
+    /// `insurance` and `negative_pnl_account_count` set on the group header. The
+    /// driver then asks the engine to VALIDATE the resulting state
+    /// (`validate_shape` + `validate_with_market`), so this is a state the engine
+    /// itself accepts — not a stub. Liquidating it on an unfunded domain forces
+    /// the engine to book the unbacked loss as RESIDUAL rather than draining
+    /// shared insurance.
+    SeedUnderwaterPosition {
+        account: u8,
+        asset: u8,
+    },
+    /// Like [`Action::SeedUnderwaterPosition`], but ALSO funds the bankruptcy
+    /// insurance domain of the liquidated long leg — i.e. the asset's SHORT-side
+    /// `insurance_domain_budget_short` — with `domain_budget` atoms.
+    ///
+    /// A long-leg liquidation books its bankruptcy loss against the
+    /// `opposite_side(Long) == Short` insurance domain
+    /// (`consume_domain_insurance_for_negative_pnl`, `v16.rs:5955`). With a ZERO
+    /// budget (the plain `SeedUnderwaterPosition` case) the engine can draw NO
+    /// insurance and must book residual, so `insurance_used == 0` and the
+    /// isolation oracle's anti-vacuity precondition is weak. Funding the
+    /// short-side budget lets the engine genuinely SPEND insurance for the
+    /// liquidated domain (`insurance_used > 0`), giving the isolation oracle the
+    /// stronger test: some insurance IS spent for the correct domain and NONE for
+    /// any other.
+    ///
+    /// The budget is set on the asset's engine slot exactly where the engine's own
+    /// proof `proof_v16_view_domain_budget_caps_bankruptcy_insurance_spend`
+    /// (`tests/proofs_v16.rs:2384`) sets it, and the resulting state is run through
+    /// the engine's `validate_shape` + `validate_with_market` before the driver
+    /// proceeds (the same discipline as [`Action::SeedUnderwaterPosition`]), so it
+    /// remains a state the engine itself accepts. `domain_budget` must keep the
+    /// group's total live domain-budget-remaining at or below `header.insurance`
+    /// (`validate_shape`, `v16.rs:4594`); the seed funds `insurance`/`vault` to
+    /// accommodate it.
+    SeedUnderwaterPositionFunded {
+        account: u8,
+        asset: u8,
+        domain_budget: u128,
+    },
+    /// Liquidate `close_q` of `account`'s position on `asset` via the engine's
+    /// `liquidate_account_not_atomic`. `close_q == 0` expresses "close the whole
+    /// position" intent (the engine clamps); a non-zero `close_q` against an
+    /// underwater leg (see [`Action::SeedUnderwaterPosition`]) drives a real
+    /// liquidation whose `LiquidationOutcomeV16` is captured into the
+    /// [`crate::driver::Observation`].
     Liquidate {
         account: u8,
         asset: u8,
+        close_q: u128,
     },
 }
 
@@ -180,7 +236,15 @@ impl Scenario {
                     check_acc(i, account, "")?;
                     check_asset(i, asset, "")?;
                 }
-                Action::Liquidate { account, asset } => {
+                Action::SeedUnderwaterPosition { account, asset } => {
+                    check_acc(i, account, "")?;
+                    check_asset(i, asset, "")?;
+                }
+                Action::SeedUnderwaterPositionFunded { account, asset, .. } => {
+                    check_acc(i, account, "")?;
+                    check_asset(i, asset, "")?;
+                }
+                Action::Liquidate { account, asset, .. } => {
                     check_acc(i, account, "")?;
                     check_asset(i, asset, "")?;
                 }

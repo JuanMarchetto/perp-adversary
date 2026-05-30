@@ -58,6 +58,7 @@ fn market_side(asset: usize, side: u8, positive_claim_bound_num: u128) -> Market
             positive_claim_bound_num,
             ..EngineDomainObs::default()
         },
+        insurance_domain_spent: 0,
     }
 }
 
@@ -184,6 +185,7 @@ fn obs_with(domains: Vec<DomainObs>, market_domains: Vec<MarketSideObs>) -> Obse
             domains,
         }],
         market_domains,
+        liquidation: None,
     }
 }
 

@@ -64,6 +64,7 @@
 //! constructing a human-readable [`Violation`] only on the error path.
 
 use crate::driver::{DomainObs, MarketSideObs, Observation};
+use crate::scenario::Action;
 
 /// `BOUND_SCALE` / `CREDIT_RATE_SCALE` from `percolator-ref/src/lib.rs:25-26`.
 pub const SCALE: u128 = 1_000_000_000_000;
@@ -486,4 +487,246 @@ pub fn check_observation_market(obs: &Observation) -> Result<(), Violation> {
         }
     }
     Ok(())
+}
+
+// ===========================================================================
+// v0.2 — liquidation insurance-domain ISOLATION oracle
+//
+// This is a CROSS-STEP (delta) oracle, distinct from O1 and the v0.1 market
+// cross-link, both of which are single-state. It mirrors the engine's guarantee
+// about how a liquidation may spend SHARED insurance:
+//
+//   When `liquidate_account_not_atomic` (`percolator-ref/src/v16.rs:9829`, SHA
+//   `71c9032`) settles a bankrupt leg, it calls
+//   `consume_domain_insurance_for_negative_pnl(asset_index, leg.side, ..)`
+//   (`v16.rs:9923`). That function (`v16.rs:5949`) computes the bankruptcy
+//   insurance domain as `insurance_domain_index(asset_index,
+//   opposite_side(leg.side))` (`v16.rs:5955`) — a domain of the SAME asset — and
+//   increments ONLY that domain's `insurance_domain_spent` by exactly the `used`
+//   amount it returns (`v16.rs:5974-5980`), which is the `insurance_used` in the
+//   `LiquidationOutcomeV16`. No OTHER domain's `insurance_domain_spent` is ever
+//   touched by a liquidation.
+//
+// So across one liquidation step the engine guarantees, over the per-side
+// `insurance_domain_spent` (`EngineAssetSlotV16Account::insurance_domain_spent_*`,
+// `v16.rs:3826`) the driver surfaces in `MarketSideObs.insurance_domain_spent`:
+//
+//   (I1) every side's spend is MONOTONE: `cur.spent >= prev.spent`            ;
+//   (I2) ISOLATION: only domains of the LIQUIDATED asset may show an increase
+//        (no cross-asset / cross-domain drain)                                ;
+//   (I3) FULL ACCOUNTING: the total spend increase across ALL observed domains
+//        equals the outcome's `insurance_used`.
+//
+// (I2)+(I3) together imply the liquidated asset's domain delta == insurance_used
+// and every other domain delta == 0 — exactly the engine's per-domain spend
+// guarantee, as asserted by its OWN conformance test
+// (`tests/v16_spec_tests.rs:342-348`: `insurance_used == 0`,
+// `insurance_domain_spent_short == 0`) and bounded by its Kani proofs
+// (`tests/proofs_v16.rs:2375` domain budget caps the spend; `:2410` reserved
+// insurance cannot be double-spent; `:2449` an unfunded domain cannot drain
+// shared insurance).
+//
+// ## Why this is NON-VACUOUS (the trap this class fell into twice)
+//
+// After a liquidation the driver runs `validate_shape` + `validate_with_market`,
+// so the post-liquidation state has ALREADY passed every single-state validator.
+// Re-checking any single state is therefore VACUOUS. The value here is the DELTA:
+// `insurance_domain_spent` is a running total; only by comparing its value BEFORE
+// and AFTER the liquidation, against the step's `insurance_used`, can isolation be
+// observed. No single observed state encodes "this step spent insurance only on
+// the liquidated domain". The `funded_liquidation_campaign` reaches an
+// engine-accepted state where `insurance_used > 0` and exactly one domain's spend
+// rises, so the oracle is exercised non-trivially (see `tests/liquidation.rs`).
+//
+// ## Fail-closed
+//
+// Pure, no `unsafe`. If a side observed in `cur` has no matching side in `prev`
+// (we cannot certify its delta), or any side's spend went BACKWARD, or the
+// accounting does not balance, the oracle returns the WORST case — a violation —
+// so it never UNDERSTATES a breach.
+// ===========================================================================
+
+/// Which liquidation insurance-isolation relationship was broken. `Copy` and
+/// allocation-free so the soundness proof can reason about the check without
+/// modelling string formatting (same discipline as [`ViolationKind`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IsolationKind {
+    /// (I1) a market side's `insurance_domain_spent` DECREASED across the step,
+    /// or a side present in `cur` is absent from `prev` so its delta cannot be
+    /// certified (fail-closed). The engine only ever increments spend.
+    SpendNotMonotone,
+    /// (I2) a domain NOT belonging to the liquidated asset showed a positive
+    /// `insurance_domain_spent` increase — a cross-domain insurance drain.
+    CrossDomainDrain,
+    /// (I3) the total `insurance_domain_spent` increase across all observed
+    /// domains does not equal the outcome's `insurance_used` (insurance spent is
+    /// unaccounted, or claimed without an observed domain to back it).
+    InsuranceSpendUnaccounted,
+}
+
+impl IsolationKind {
+    /// The engine citation this breaks.
+    pub fn requirement(self) -> &'static str {
+        match self {
+            IsolationKind::SpendNotMonotone => "insurance isolation (v16.rs:5974)",
+            IsolationKind::CrossDomainDrain => "insurance isolation (v16.rs:5955)",
+            IsolationKind::InsuranceSpendUnaccounted => "insurance isolation (v16.rs:5980)",
+        }
+    }
+}
+
+/// Locate the market side `(asset, side)` in `sides`, returning its
+/// `insurance_domain_spent`. The driver emits all observed sides in
+/// `Observation.market_domains`; pairing by key (not index) is robust to ordering.
+#[inline]
+fn spent_of(sides: &[MarketSideObs], asset: usize, side: u8) -> Option<u128> {
+    sides
+        .iter()
+        .find(|m| m.asset == asset && m.side == side)
+        .map(|m| m.insurance_domain_spent)
+}
+
+/// Liquidation insurance-isolation arithmetic core: allocation-free, pure,
+/// fail-closed. Given the pre-step market sides `prev`, the post-step market sides
+/// `cur`, the `liquidated_asset` (from the step's `Liquidate` action), and the
+/// outcome's `insurance_used`, returns `Ok(())` iff invariants (I1)-(I3) above
+/// hold, else the first [`IsolationKind`] together with the offending side's
+/// `(asset, side)` for reporting.
+///
+/// This is the function the Kani soundness proof verifies. It iterates `cur`'s
+/// sides (the engine's observable domains) and pairs each against `prev` by key.
+#[inline]
+pub fn isolation_kind(
+    prev: &[MarketSideObs],
+    cur: &[MarketSideObs],
+    liquidated_asset: usize,
+    insurance_used: u128,
+) -> Result<(), (IsolationKind, usize, u8)> {
+    let mut total_increase: u128 = 0;
+    for m in cur {
+        // Pair against the pre-step baseline for THIS side. A missing baseline
+        // cannot be certified -> fail closed (I1).
+        let before = match spent_of(prev, m.asset, m.side) {
+            Some(v) => v,
+            None => return Err((IsolationKind::SpendNotMonotone, m.asset, m.side)),
+        };
+        let after = m.insurance_domain_spent;
+        // (I1) monotonicity: spend never decreases. A backward move is fail-closed.
+        let delta = match after.checked_sub(before) {
+            Some(d) => d,
+            None => return Err((IsolationKind::SpendNotMonotone, m.asset, m.side)),
+        };
+        if delta == 0 {
+            continue;
+        }
+        // (I2) isolation: only the liquidated asset's domains may rise.
+        if m.asset != liquidated_asset {
+            return Err((IsolationKind::CrossDomainDrain, m.asset, m.side));
+        }
+        // Accumulate the total increase (fail-closed on overflow).
+        total_increase = match total_increase.checked_add(delta) {
+            Some(v) => v,
+            None => return Err((IsolationKind::InsuranceSpendUnaccounted, m.asset, m.side)),
+        };
+    }
+    // (I3) full accounting: total observed spend increase == insurance_used.
+    // Because (I2) already confined every increase to the liquidated asset's
+    // domains, this equality also pins insurance_used to the liquidated domain's
+    // delta — it can be neither MORE (claimed but unobserved) nor LESS (observed
+    // but unreported) than what the outcome states.
+    if total_increase != insurance_used {
+        return Err((
+            IsolationKind::InsuranceSpendUnaccounted,
+            liquidated_asset,
+            0,
+        ));
+    }
+    Ok(())
+}
+
+/// v0.2 liquidation insurance-domain ISOLATION oracle: for a step whose
+/// `cur.liquidation` is `Some`, check that the liquidation spent SHARED insurance
+/// only on the liquidated asset's bankruptcy domain and that the spend is fully
+/// accounted by the outcome's `insurance_used` — exactly the engine's own
+/// `consume_domain_insurance_for_negative_pnl` guarantee (`v16.rs:5949-5996`),
+/// observed as a DELTA across the `(prev, cur)` `insurance_domain_spent` values.
+///
+/// Steps that are not a `cur.liquidation == Some` liquidation are a no-op (the
+/// oracle does not apply). Pure and fail-closed; wraps [`isolation_kind`], adding
+/// a human-readable detail string only on the error path.
+pub fn liquidation_insurance_isolation(
+    prev: &Observation,
+    cur: &Observation,
+) -> Result<(), Violation> {
+    // Only liquidation steps carry an outcome; nothing else can spend insurance
+    // this way, so there is no delta to police.
+    let Some(liq) = cur.liquidation.as_ref() else {
+        return Ok(());
+    };
+    // The liquidated asset comes from the step's own action. (The engine's
+    // bankruptcy domain is `insurance_domain_index(asset, opposite_side(leg.side))`
+    // — always a domain of THIS asset; the oracle keys on the asset, the level at
+    // which isolation is guaranteed, without needing the unobserved leg side.)
+    let liquidated_asset = match cur.action {
+        Action::Liquidate { asset, .. } => asset as usize,
+        // A liquidation outcome with a non-Liquidate action is impossible from the
+        // driver; fail closed if it ever occurs rather than certify blindly.
+        _ => {
+            return Err(Violation {
+                requirement: IsolationKind::CrossDomainDrain.requirement(),
+                detail: "liquidation outcome present on a non-Liquidate step; \
+                         cannot identify the liquidated asset to certify isolation"
+                    .to_string(),
+            })
+        }
+    };
+
+    isolation_kind(
+        &prev.market_domains,
+        &cur.market_domains,
+        liquidated_asset,
+        liq.insurance_used,
+    )
+    .map_err(|(kind, asset, side)| Violation {
+        requirement: kind.requirement(),
+        detail: describe_isolation(kind, asset, side, liquidated_asset, liq.insurance_used),
+    })
+}
+
+/// Build the human-readable detail for an [`IsolationKind`]. Only ever called on
+/// the error path, so its `format!` allocations stay off the model-checked core.
+fn describe_isolation(
+    kind: IsolationKind,
+    asset: usize,
+    side: u8,
+    liquidated_asset: usize,
+    insurance_used: u128,
+) -> String {
+    match kind {
+        IsolationKind::SpendNotMonotone => format!(
+            "asset {asset}, side {side}: insurance_domain_spent moved backward or has no \
+             pre-liquidation baseline; cannot certify the spend delta (liquidated asset \
+             {liquidated_asset})"
+        ),
+        IsolationKind::CrossDomainDrain => format!(
+            "asset {asset}, side {side}: insurance_domain_spent increased while liquidating \
+             asset {liquidated_asset} — a cross-domain insurance drain (v16.rs:5955 charges \
+             only the liquidated asset's bankruptcy domain)"
+        ),
+        IsolationKind::InsuranceSpendUnaccounted => format!(
+            "liquidated asset {liquidated_asset}: total insurance_domain_spent increase across \
+             observed domains does not equal the outcome's insurance_used({insurance_used}) \
+             (v16.rs:5980 increments the liquidated domain by exactly insurance_used)"
+        ),
+    }
+}
+
+/// Run [`liquidation_insurance_isolation`] over a consecutive `(prev, cur)`
+/// observation pair. A thin convenience over the pair-wise oracle so a cross-step
+/// runner can fold it across a trace's observations.
+pub fn check_step_insurance_isolation(
+    prev: &Observation,
+    cur: &Observation,
+) -> Result<(), Violation> {
+    liquidation_insurance_isolation(prev, cur)
 }
