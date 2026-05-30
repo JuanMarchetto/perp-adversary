@@ -51,10 +51,9 @@ cargo kani --harness realizability_is_sound  # the oracle soundness proof (needs
 cargo run --bin replay -- scenarios/jelly.json
 ```
 
-## Design & roadmap
+## Roadmap
 
-- Design spec: [`docs/superpowers/specs/2026-05-30-perp-adversary-design.md`](docs/superpowers/specs/2026-05-30-perp-adversary-design.md)
-- Implementation plan: [`docs/superpowers/plans/2026-05-30-perp-adversary-v0.md`](docs/superpowers/plans/2026-05-30-perp-adversary-v0.md)
+- **v0.1** — a market-engine oracle for the outer realizability link the per-account O1 deliberately scopes out (`source_claim_bound_num ≤ positive_claim_bound_num`, against `Market::engine.source_credit_long/short`), plus more attack classes and a deliberate engine re-pin.
 
 ## License
 
