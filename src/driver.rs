@@ -8,8 +8,9 @@ use percolator::v16::{
     v16_domain_count_for_market_slots, EngineAssetSlotV16Account, LiquidationRequestV16, Market,
     MarketGroupV16HeaderAccount, MarketGroupV16ViewMut, PermissionlessCrankActionV16,
     PermissionlessCrankRequestV16, PortfolioAccountV16Account, PortfolioSourceDomainV16Account,
-    PortfolioV16ViewMut, ProvenanceHeaderV16, ProvenanceHeaderV16Account, TradeRequestV16,
-    V16Config, V16Error, V16PodI128, V16PodU128, V16PodU64,
+    PortfolioV16ViewMut, ProvenanceHeaderV16, ProvenanceHeaderV16Account,
+    SourceCreditStateV16Account, TradeRequestV16, V16Config, V16Error, V16PodI128, V16PodU128,
+    V16PodU64,
 };
 
 /// `BOUND_SCALE` from `percolator-ref/src/lib.rs:25`. Claim/backing "num" fields
@@ -48,12 +49,45 @@ pub struct AccountObs {
     pub domains: Vec<DomainObs>,
 }
 
+/// Observable MARKET-ENGINE source-credit state, mirroring `SourceCreditStateV16`
+/// (`percolator-ref/src/v16.rs:1804`). Distinct from the per-account
+/// [`DomainObs`]: this lives on a market asset's engine slot
+/// (`Market::engine.source_credit_long/short`), read via
+/// `SourceCreditStateV16Account::try_to_runtime`. The v0.1 market-engine oracle
+/// is defined over these fields.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct EngineDomainObs {
+    pub positive_claim_bound_num: u128,
+    pub exact_positive_claim_num: u128,
+    pub fresh_reserved_backing_num: u128,
+    pub spent_backing_num: u128,
+    pub provider_receivable_num: u128,
+    pub valid_liened_backing_num: u128,
+    pub impaired_liened_backing_num: u128,
+    pub insurance_credit_reserved_num: u128,
+    pub valid_liened_insurance_num: u128,
+    pub impaired_liened_insurance_num: u128,
+    pub credit_rate_num: u128,
+    pub credit_epoch: u64,
+}
+
+/// One market-engine source-credit observation: the state of `asset`'s engine
+/// slot on a given `side` (long = 0, short = 1).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MarketSideObs {
+    pub asset: usize,
+    pub side: u8,
+    pub state: EngineDomainObs,
+}
+
 #[derive(Clone, Debug)]
 pub struct Observation {
     pub step: usize,
     pub action: Action,
     pub result: Result<(), String>,
     pub accounts: Vec<AccountObs>,
+    /// Market-engine source-credit state per asset, both sides (long, short).
+    pub market_domains: Vec<MarketSideObs>,
 }
 
 #[derive(Clone, Debug)]
@@ -127,6 +161,57 @@ impl Engine {
                 domains: doms.iter().map(read_domain).collect(),
             })
             .collect()
+    }
+
+    /// Read post-step MARKET-ENGINE source-credit state, per asset and per side
+    /// (long = 0, short = 1). Each market's engine slot
+    /// (`Market::engine`, the same `EngineAssetSlotV16Account` the engine reaches
+    /// via `engine_slot()`) carries `source_credit_long`/`source_credit_short`;
+    /// each is decoded with `SourceCreditStateV16Account::try_to_runtime`. MUST be
+    /// called after all engine views are dropped (same discipline as
+    /// [`Engine::observe`]).
+    fn observe_markets(&self) -> Vec<MarketSideObs> {
+        let mut out = Vec::with_capacity(self.mk.len() * 2);
+        for (asset, market) in self.mk.iter().enumerate() {
+            // `market.engine` is the engine slot (`engine_slot()` returns
+            // `&self.engine`); both fields are public on the engine slot.
+            let slot = &market.engine;
+            out.push(MarketSideObs {
+                asset,
+                side: 0,
+                state: read_source_credit(&slot.source_credit_long),
+            });
+            out.push(MarketSideObs {
+                asset,
+                side: 1,
+                state: read_source_credit(&slot.source_credit_short),
+            });
+        }
+        out
+    }
+}
+
+/// Decode a market-engine `SourceCreditStateV16Account` into its observable
+/// fields. If the engine's static validator rejects the decoded state (which it
+/// should never do for a state the engine itself produced), fall back to the
+/// zero state — observation must never panic.
+fn read_source_credit(s: &SourceCreditStateV16Account) -> EngineDomainObs {
+    match s.try_to_runtime() {
+        Ok(v) => EngineDomainObs {
+            positive_claim_bound_num: v.positive_claim_bound_num,
+            exact_positive_claim_num: v.exact_positive_claim_num,
+            fresh_reserved_backing_num: v.fresh_reserved_backing_num,
+            spent_backing_num: v.spent_backing_num,
+            provider_receivable_num: v.provider_receivable_num,
+            valid_liened_backing_num: v.valid_liened_backing_num,
+            impaired_liened_backing_num: v.impaired_liened_backing_num,
+            insurance_credit_reserved_num: v.insurance_credit_reserved_num,
+            valid_liened_insurance_num: v.valid_liened_insurance_num,
+            impaired_liened_insurance_num: v.impaired_liened_insurance_num,
+            credit_rate_num: v.credit_rate_num,
+            credit_epoch: v.credit_epoch,
+        },
+        Err(_) => EngineDomainObs::default(),
     }
 }
 
@@ -395,13 +480,16 @@ pub fn run(s: &Scenario) -> Trace {
     for (step, action) in s.actions.iter().enumerate() {
         let result = apply(&mut eng, *action, &mut external_in, &mut external_out)
             .map_err(|e| format!("{e:?}"));
-        // Views from apply() are out of scope here; safe to read account state.
+        // Views from apply() are out of scope here; safe to read account and
+        // market-engine state.
         let accounts = eng.observe();
+        let market_domains = eng.observe_markets();
         observations.push(Observation {
             step,
             action: *action,
             result,
             accounts,
+            market_domains,
         });
     }
 

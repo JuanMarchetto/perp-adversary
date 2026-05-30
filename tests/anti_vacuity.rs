@@ -19,6 +19,46 @@
 use perp_adversary::driver::{lien_creating_campaign, run, DomainObs};
 use perp_adversary::oracles::check_observation;
 
+/// The lien-creating campaign seeds the MARKET-ENGINE source-credit state on
+/// asset 0's long side (domain `asset*2`) via `SeedSourceClaim`, which calls the
+/// engine's `add_source_positive_claim_bound_not_atomic` +
+/// `add_fresh_counterparty_backing_not_atomic`. That state is a SEPARATE thing
+/// from the per-account source domain (`DomainObs`): each market asset carries
+/// `source_credit_long`/`source_credit_short` (`SourceCreditStateV16`) on its
+/// engine slot. The v0.1 market-engine oracle reads it; this test pins the
+/// prerequisite — that the driver actually OBSERVES that non-zero market-engine
+/// state, so the future oracle is not vacuous.
+#[test]
+fn driver_observes_nonzero_market_engine_source_credit_state() {
+    let s = lien_creating_campaign();
+    let trace = run(&s);
+
+    let found = trace.observations.iter().find_map(|obs| {
+        obs.market_domains
+            .iter()
+            .find(|m| m.state.positive_claim_bound_num != 0)
+            .map(|m| (obs.step, *m))
+    });
+
+    let (step, m) = found.unwrap_or_else(|| {
+        panic!(
+            "driver must observe a non-zero market-engine source-credit state; the \
+             lien-creating campaign seeds asset 0 long via SeedSourceClaim, so some \
+             observation's market_domains must carry a non-zero \
+             positive_claim_bound_num"
+        );
+    });
+
+    // Seeded on asset 0's LONG side (domain asset*2 == 0 -> side 0).
+    assert_eq!(m.asset, 0, "seed was on asset 0 (step {step})");
+    assert_eq!(m.side, 0, "seed was on the long side (step {step})");
+    assert!(
+        m.state.positive_claim_bound_num != 0,
+        "market-engine positive_claim_bound_num must be non-zero at step {step}: {:?}",
+        m.state
+    );
+}
+
 /// The first observation whose state carries a real, engine-drawn lien
 /// (`source_claim_liened_num != 0`), with its location.
 fn first_liened_domain(
