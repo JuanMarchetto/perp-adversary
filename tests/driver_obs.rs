@@ -29,3 +29,36 @@ fn trace_records_capital_and_external_flows() {
     assert_eq!(trace.external_in[0], 1_000);
     assert_eq!(trace.external_out[0], 400);
 }
+
+#[test]
+fn matched_trade_opens_both_legs() {
+    let s = Scenario {
+        n_markets: 1,
+        n_accounts: 2,
+        actions: vec![
+            Action::Deposit {
+                account: 0,
+                amount: 1_000_000,
+            },
+            Action::Deposit {
+                account: 1,
+                amount: 1_000_000,
+            },
+            Action::Trade {
+                long: 0,
+                short: 1,
+                asset: 0,
+                size_q: 1_000,
+                exec_price: 100,
+                fee_bps: 0,
+            },
+        ],
+    };
+    let t = run(&s);
+    let last = t.observations.last().unwrap();
+    assert!(
+        last.result.is_ok(),
+        "funded matched trade should fill: {:?}",
+        last.result
+    );
+}
