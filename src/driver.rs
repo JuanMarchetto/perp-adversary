@@ -439,7 +439,15 @@ fn apply(
             Ok(None)
         }
         Action::SeedUnderwaterPosition { account, asset } => {
-            seed_underwater_position(eng, account, asset)?;
+            seed_underwater_position(eng, account, asset, 0)?;
+            Ok(None)
+        }
+        Action::SeedUnderwaterPositionFunded {
+            account,
+            asset,
+            domain_budget,
+        } => {
+            seed_underwater_position(eng, account, asset, domain_budget)?;
             Ok(None)
         }
         Action::Liquidate {
@@ -492,14 +500,44 @@ fn apply(
 /// `validate_with_market` accepts it. The function then runs `validate_shape` +
 /// `validate_with_market`, propagating any rejection as an error so the driver
 /// only ever proceeds from an engine-accepted state.
-fn seed_underwater_position(eng: &mut Engine, account: u8, asset: u8) -> Result<(), V16Error> {
+///
+/// `domain_budget` (atoms) funds the SHORT-side bankruptcy insurance domain of
+/// the long leg (`insurance_domain_budget_short`). With `0` the engine can draw
+/// no insurance and books residual (`insurance_used == 0`); with a positive value
+/// the engine genuinely SPENDS that domain's insurance on liquidation
+/// (`insurance_used > 0`). The seed adds `domain_budget` to both `vault` and
+/// `insurance` so that, post-funding, the group still satisfies
+/// `validate_shape`'s `senior <= vault` (v16.rs:4590) and
+/// `live_domain_budget_remaining_atoms <= insurance` (v16.rs:4594) invariants.
+fn seed_underwater_position(
+    eng: &mut Engine,
+    account: u8,
+    asset: u8,
+    domain_budget: u128,
+) -> Result<(), V16Error> {
     let ai = asset as usize;
 
-    // Group-header bookkeeping the underwater leg requires.
-    eng.mh.vault = V16PodU128::new(eng.mh.vault.get().saturating_add(50));
-    eng.mh.insurance = V16PodU128::new(eng.mh.insurance.get().saturating_add(50));
+    // Group-header bookkeeping the underwater leg requires. The base 50 mirrors
+    // the engine's own conformance fixture; the extra `domain_budget` keeps the
+    // funded short-side budget within `validate_shape`'s insurance ceiling.
+    let extra = 50u128
+        .checked_add(domain_budget)
+        .ok_or(V16Error::ArithmeticOverflow)?;
+    eng.mh.vault = V16PodU128::new(eng.mh.vault.get().saturating_add(extra));
+    eng.mh.insurance = V16PodU128::new(eng.mh.insurance.get().saturating_add(extra));
     eng.mh.negative_pnl_account_count =
         V16PodU64::new(eng.mh.negative_pnl_account_count.get().saturating_add(1));
+
+    // Fund the long leg's bankruptcy insurance domain: a long-leg liquidation
+    // books its loss against the asset's SHORT-side insurance domain
+    // (`consume_domain_insurance_for_negative_pnl` takes `opposite_side(Long)`,
+    // v16.rs:5955). Setting `insurance_domain_budget_short` is exactly where the
+    // engine's proof `proof_v16_view_domain_budget_caps_bankruptcy_insurance_spend`
+    // (tests/proofs_v16.rs:2384) sets it. `spent` stays 0, so
+    // `validate_domain_shape_for_view`'s `spent <= budget` (v16.rs:4660) holds.
+    if domain_budget != 0 {
+        eng.mk[ai].engine.insurance_domain_budget_short = V16PodU128::new(domain_budget);
+    }
 
     // Asset-level open interest / loss-weight / position-count totals: two longs
     // and two shorts of POS_SCALE each (the account contributes one long leg).
@@ -618,6 +656,48 @@ pub fn liquidation_campaign() -> Scenario {
             },
             // Close the full POS_SCALE long leg: a genuine liquidation that books
             // residual on the unfunded domain.
+            Liquidate {
+                account: 0,
+                asset: 0,
+                close_q: POS_SCALE,
+            },
+        ],
+    }
+}
+
+/// A campaign that drives a REAL liquidation which GENUINELY SPENDS insurance for
+/// the liquidated domain (`insurance_used > 0`). It seeds the same
+/// engine-accepted underwater long position as [`liquidation_campaign`], but
+/// FUNDS the bankruptcy insurance domain (the asset's short-side
+/// `insurance_domain_budget_short`) via [`Action::SeedUnderwaterPositionFunded`].
+///
+/// On liquidation the engine draws up to that budget from shared insurance for
+/// the liquidated long leg's domain — so the resulting `LiquidationObs` has
+/// `insurance_used > 0` AND the asset's short-side `insurance_domain_spent`
+/// increases by exactly that amount, while NO other domain's spend changes. This
+/// is the STRONGER input for the insurance-isolation oracle: insurance IS spent
+/// for the correct domain and NONE for any other.
+///
+/// The 5-atom residual loss seeded by `SeedUnderwaterPositionFunded` is fully
+/// within a budget of 5, so the engine spends all 5 from insurance and books no
+/// residual; this is the engine's own
+/// `proof_v16_view_domain_budget_caps_bankruptcy_insurance_spend` shape
+/// (`tests/proofs_v16.rs:2375`) reached through the public liquidation entrypoint.
+pub fn funded_liquidation_campaign() -> Scenario {
+    use crate::scenario::Action::*;
+    Scenario {
+        n_markets: 1,
+        n_accounts: 1,
+        actions: vec![
+            // Underwater long leg PLUS a funded short-side insurance domain budget
+            // (5 atoms) — enough to cover the seeded 5-atom bankruptcy loss.
+            SeedUnderwaterPositionFunded {
+                account: 0,
+                asset: 0,
+                domain_budget: 5,
+            },
+            // Liquidate the full long leg: the engine spends the funded domain's
+            // insurance (insurance_used > 0) for the liquidated domain only.
             Liquidate {
                 account: 0,
                 asset: 0,

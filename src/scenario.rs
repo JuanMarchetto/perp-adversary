@@ -97,6 +97,35 @@ pub enum Action {
         account: u8,
         asset: u8,
     },
+    /// Like [`Action::SeedUnderwaterPosition`], but ALSO funds the bankruptcy
+    /// insurance domain of the liquidated long leg — i.e. the asset's SHORT-side
+    /// `insurance_domain_budget_short` — with `domain_budget` atoms.
+    ///
+    /// A long-leg liquidation books its bankruptcy loss against the
+    /// `opposite_side(Long) == Short` insurance domain
+    /// (`consume_domain_insurance_for_negative_pnl`, `v16.rs:5955`). With a ZERO
+    /// budget (the plain `SeedUnderwaterPosition` case) the engine can draw NO
+    /// insurance and must book residual, so `insurance_used == 0` and the
+    /// isolation oracle's anti-vacuity precondition is weak. Funding the
+    /// short-side budget lets the engine genuinely SPEND insurance for the
+    /// liquidated domain (`insurance_used > 0`), giving the isolation oracle the
+    /// stronger test: some insurance IS spent for the correct domain and NONE for
+    /// any other.
+    ///
+    /// The budget is set on the asset's engine slot exactly where the engine's own
+    /// proof `proof_v16_view_domain_budget_caps_bankruptcy_insurance_spend`
+    /// (`tests/proofs_v16.rs:2384`) sets it, and the resulting state is run through
+    /// the engine's `validate_shape` + `validate_with_market` before the driver
+    /// proceeds (the same discipline as [`Action::SeedUnderwaterPosition`]), so it
+    /// remains a state the engine itself accepts. `domain_budget` must keep the
+    /// group's total live domain-budget-remaining at or below `header.insurance`
+    /// (`validate_shape`, `v16.rs:4594`); the seed funds `insurance`/`vault` to
+    /// accommodate it.
+    SeedUnderwaterPositionFunded {
+        account: u8,
+        asset: u8,
+        domain_budget: u128,
+    },
     /// Liquidate `close_q` of `account`'s position on `asset` via the engine's
     /// `liquidate_account_not_atomic`. `close_q == 0` expresses "close the whole
     /// position" intent (the engine clamps); a non-zero `close_q` against an
@@ -208,6 +237,10 @@ impl Scenario {
                     check_asset(i, asset, "")?;
                 }
                 Action::SeedUnderwaterPosition { account, asset } => {
+                    check_acc(i, account, "")?;
+                    check_asset(i, asset, "")?;
+                }
+                Action::SeedUnderwaterPositionFunded { account, asset, .. } => {
                     check_acc(i, account, "")?;
                     check_asset(i, asset, "")?;
                 }

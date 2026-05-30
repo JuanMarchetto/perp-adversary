@@ -16,7 +16,7 @@
 //! If this ever fails, the liquidation attack class has gone vacuous and must be
 //! treated as a loud regression — NEVER weaken these assertions to make it pass.
 
-use perp_adversary::driver::{liquidation_campaign, run};
+use perp_adversary::driver::{funded_liquidation_campaign, liquidation_campaign, run};
 
 #[test]
 fn campaign_fires_a_real_liquidation_that_books_residual() {
@@ -65,5 +65,69 @@ fn campaign_fires_a_real_liquidation_that_books_residual() {
     assert_eq!(
         liq.insurance_used, 0,
         "liquidation at step {step} must not drain shared insurance: {liq:?}"
+    );
+}
+
+/// Anti-vacuity for the v0.2-B insurance-ISOLATION oracle: the isolation oracle is
+/// strongest when some insurance IS actually spent for the liquidated domain (and
+/// NONE for any other). This gate proves the FUNDED campaign reaches an
+/// engine-accepted state where `insurance_used > 0` AND exactly the liquidated
+/// asset's short-side (the long leg's bankruptcy domain) `insurance_domain_spent`
+/// rises by that amount, while every other domain stays put. It mirrors the
+/// engine's own `proof_v16_view_domain_budget_caps_bankruptcy_insurance_spend`
+/// (`tests/proofs_v16.rs:2375`) reached through the public liquidation entrypoint.
+///
+/// If this ever fails, the isolation oracle has lost its stronger (insurance-IS-
+/// spent) input and falls back to the weak no-spend path — treat it as a loud
+/// regression; NEVER weaken these assertions to make it pass.
+#[test]
+fn funded_campaign_spends_insurance_only_on_the_liquidated_domain() {
+    let s = funded_liquidation_campaign();
+    let trace = run(&s);
+
+    // Locate the pre- and post-liquidation observations.
+    let liq_step = trace
+        .observations
+        .iter()
+        .position(|o| o.liquidation.is_some())
+        .expect("funded campaign must fire a liquidation");
+    assert!(
+        liq_step >= 1,
+        "liquidation must have a predecessor observation to delta against"
+    );
+    let prev = &trace.observations[liq_step - 1];
+    let cur = &trace.observations[liq_step];
+    let liq = cur.liquidation.unwrap();
+
+    assert!(
+        cur.result.is_ok(),
+        "funded liquidation step should progress, got {:?}; outcome {liq:?}",
+        cur.result
+    );
+
+    // Non-vacuity: insurance WAS genuinely spent.
+    assert!(
+        liq.insurance_used > 0,
+        "funded liquidation must spend insurance (insurance_used > 0): {liq:?}"
+    );
+
+    // The spend is concentrated on asset 0's SHORT side (the long leg's
+    // bankruptcy domain = opposite_side(Long)); every other domain is unchanged.
+    let spent = |obs: &perp_adversary::driver::Observation, asset: usize, side: u8| -> u128 {
+        obs.market_domains
+            .iter()
+            .find(|m| m.asset == asset && m.side == side)
+            .map(|m| m.insurance_domain_spent)
+            .unwrap_or_else(|| panic!("missing market side ({asset}, {side})"))
+    };
+    let short_delta = spent(cur, 0, 1) - spent(prev, 0, 1);
+    let long_delta = spent(cur, 0, 0) - spent(prev, 0, 0);
+    assert_eq!(
+        short_delta, liq.insurance_used,
+        "liquidated domain (asset 0, short) spend must rise by exactly insurance_used: {liq:?}"
+    );
+    assert_eq!(
+        long_delta, 0,
+        "the non-bankruptcy side of the liquidated asset must not be charged: {liq:?}"
     );
 }
