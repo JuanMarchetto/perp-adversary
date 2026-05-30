@@ -5,13 +5,15 @@
 //! only AFTER the engine views (which mutably borrow the accounts) are dropped.
 use crate::scenario::{Action, Scenario};
 use percolator::v16::{
-    v16_domain_count_for_market_slots, EngineAssetSlotV16Account, LiquidationRequestV16, Market,
-    MarketGroupV16HeaderAccount, MarketGroupV16ViewMut, PermissionlessCrankActionV16,
-    PermissionlessCrankRequestV16, PortfolioAccountV16Account, PortfolioSourceDomainV16Account,
-    PortfolioV16ViewMut, ProvenanceHeaderV16, ProvenanceHeaderV16Account,
-    SourceCreditStateV16Account, TradeRequestV16, V16Config, V16Error, V16PodI128, V16PodU128,
-    V16PodU64,
+    v16_domain_count_for_market_slots, AssetStateV16Account, EngineAssetSlotV16Account,
+    LiquidationOutcomeV16, LiquidationRequestV16, Market, MarketGroupV16HeaderAccount,
+    MarketGroupV16ViewMut, PermissionlessCrankActionV16, PermissionlessCrankRequestV16,
+    PortfolioAccountV16Account, PortfolioLegV16, PortfolioLegV16Account,
+    PortfolioSourceDomainV16Account, PortfolioV16ViewMut, ProvenanceHeaderV16,
+    ProvenanceHeaderV16Account, SideV16, SourceCreditStateV16Account, TradeRequestV16, V16Config,
+    V16Error, V16PodI128, V16PodU128, V16PodU64,
 };
+use percolator::{ADL_ONE, POS_SCALE};
 
 /// `BOUND_SCALE` from `percolator-ref/src/lib.rs:25`. Claim/backing "num" fields
 /// are amounts scaled by this; `*_effective_reserved` are unscaled atoms.
@@ -85,6 +87,26 @@ pub struct MarketSideObs {
     /// than any convention.
     pub market_id: u64,
     pub state: EngineDomainObs,
+    /// This side's `insurance_domain_spent_*` on the engine slot
+    /// (`EngineAssetSlotV16Account::insurance_domain_spent_long/short`,
+    /// `percolator-ref/src/v16.rs:3826`). A liquidation on a properly-funded
+    /// domain that draws shared insurance bumps this; a liquidation that books
+    /// residual instead leaves it at 0. Surfacing it gives the v0.2-B
+    /// insurance-isolation oracle the real engine quantity to police.
+    pub insurance_domain_spent: u128,
+}
+
+/// Observable result of a single `liquidate_account_not_atomic` call, mirroring
+/// the engine's `LiquidationOutcomeV16` (`percolator-ref/src/v16.rs:3113`).
+/// Present on an [`Observation`] iff that step was an [`Action::Liquidate`] the
+/// engine accepted.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LiquidationObs {
+    pub closed_q: u128,
+    pub insurance_used: u128,
+    pub residual_booked: u128,
+    pub explicit_loss: u128,
+    pub fee_charged: u128,
 }
 
 #[derive(Clone, Debug)]
@@ -95,6 +117,9 @@ pub struct Observation {
     pub accounts: Vec<AccountObs>,
     /// Market-engine source-credit state per asset, both sides (long, short).
     pub market_domains: Vec<MarketSideObs>,
+    /// The `LiquidationOutcomeV16` captured when this step was an
+    /// [`Action::Liquidate`] the engine accepted; `None` otherwise.
+    pub liquidation: Option<LiquidationObs>,
 }
 
 #[derive(Clone, Debug)]
@@ -191,12 +216,14 @@ impl Engine {
                 side: 0,
                 market_id,
                 state: read_source_credit(&slot.source_credit_long),
+                insurance_domain_spent: slot.insurance_domain_spent_long.get(),
             });
             out.push(MarketSideObs {
                 asset,
                 side: 1,
                 market_id,
                 state: read_source_credit(&slot.source_credit_short),
+                insurance_domain_spent: slot.insurance_domain_spent_short.get(),
             });
         }
         out
@@ -271,12 +298,15 @@ fn disjoint_two<'a>(
 
 /// Apply a single action to the engine, threading external-flow tallies.
 /// Engine views constructed here are dropped before the caller observes state.
+/// Returns the `LiquidationOutcomeV16` (as a [`LiquidationObs`]) when the action
+/// is a liquidation the engine accepted, so [`run`] can record it on the step's
+/// [`Observation`]; all other actions return `Ok(None)`.
 fn apply(
     eng: &mut Engine,
     action: Action,
     ext_in: &mut [u128],
     ext_out: &mut [u128],
-) -> Result<(), V16Error> {
+) -> Result<Option<LiquidationObs>, V16Error> {
     match action {
         Action::Deposit { account, amount } => {
             let mut mv = MarketGroupV16ViewMut::new(&mut eng.mh, &mut eng.mk);
@@ -286,7 +316,7 @@ fn apply(
             );
             mv.deposit_not_atomic(&mut av, amount)?;
             ext_in[account as usize] = ext_in[account as usize].saturating_add(amount);
-            Ok(())
+            Ok(None)
         }
         Action::Withdraw { account, amount } => {
             let mut mv = MarketGroupV16ViewMut::new(&mut eng.mh, &mut eng.mk);
@@ -296,7 +326,7 @@ fn apply(
             );
             mv.withdraw_not_atomic(&mut av, amount)?;
             ext_out[account as usize] = ext_out[account as usize].saturating_add(amount);
-            Ok(())
+            Ok(None)
         }
         Action::Trade {
             long,
@@ -322,7 +352,7 @@ fn apply(
                 fee_bps,
             };
             mv.execute_trade_with_fee_in_place_not_atomic(&mut lv, &mut sv, req)?;
-            Ok(())
+            Ok(None)
         }
         Action::MovePrice {
             asset,
@@ -331,7 +361,7 @@ fn apply(
         } => {
             let mut mv = MarketGroupV16ViewMut::new(&mut eng.mh, &mut eng.mk);
             mv.accrue_asset_to_not_atomic(asset as usize, now_slot, effective_price, 0, false)?;
-            Ok(())
+            Ok(None)
         }
         Action::Crank {
             account,
@@ -357,7 +387,7 @@ fn apply(
                 action: PermissionlessCrankActionV16::Refresh,
             };
             mv.permissionless_crank_not_atomic(&mut av, req)?;
-            Ok(())
+            Ok(None)
         }
         Action::SeedSourceClaim {
             account,
@@ -406,9 +436,17 @@ fn apply(
                 );
                 av.validate_with_market(&mv.as_view())?;
             }
-            Ok(())
+            Ok(None)
         }
-        Action::Liquidate { account, asset } => {
+        Action::SeedUnderwaterPosition { account, asset } => {
+            seed_underwater_position(eng, account, asset)?;
+            Ok(None)
+        }
+        Action::Liquidate {
+            account,
+            asset,
+            close_q,
+        } => {
             let mut mv = MarketGroupV16ViewMut::new(&mut eng.mh, &mut eng.mk);
             let mut av = PortfolioV16ViewMut::new(
                 &mut eng.accts[account as usize],
@@ -416,16 +454,95 @@ fn apply(
             );
             // LiquidationRequestV16 { asset_index, close_q, fee_bps } (:3105);
             // it does not derive Default, so construct it explicitly. close_q == 0
-            // expresses "close the whole position" intent; the engine clamps.
+            // expresses "close the whole position" intent (the engine clamps); a
+            // non-zero close_q against an underwater leg (see
+            // `seed_underwater_position`) drives a real liquidation.
             let req = LiquidationRequestV16 {
                 asset_index: asset as usize,
-                close_q: 0,
+                close_q,
                 fee_bps: 0,
             };
-            mv.liquidate_account_not_atomic(&mut av, req)?;
-            Ok(())
+            let out: LiquidationOutcomeV16 = mv.liquidate_account_not_atomic(&mut av, req)?;
+            Ok(Some(LiquidationObs {
+                closed_q: out.closed_q,
+                insurance_used: out.insurance_used,
+                residual_booked: out.residual_booked,
+                explicit_loss: out.explicit_loss,
+                fee_charged: out.fee_charged,
+            }))
         }
     }
+}
+
+/// Drive `account` into an engine-accepted UNDERWATER state on `asset`'s long
+/// side via direct field writes, mirroring the engine's OWN conformance test
+/// `v16_public_liquidation_on_unfunded_domain_cannot_drain_shared_insurance`
+/// (`/tmp/percolator-ref/tests/v16_spec_tests.rs:289`).
+///
+/// The state: a single open long leg of `POS_SCALE`, negative account PnL, and
+/// matching open-interest / loss-weight / stored-position-count totals on the
+/// asset (two longs and two shorts so the account's leg is not the only OI),
+/// with `vault`, `insurance` and `negative_pnl_account_count` on the group
+/// header. Liquidating this on an UNFUNDED domain forces the engine to book the
+/// unbacked loss as residual rather than draining shared insurance.
+///
+/// The leg's snapshot fields (`k_snap`, `f_snap`, `epoch_snap`, `b_snap`,
+/// `b_epoch_snap`) are taken from the asset's current engine state, exactly as
+/// the spec test does, so the leg is consistent with the asset and the engine's
+/// `validate_with_market` accepts it. The function then runs `validate_shape` +
+/// `validate_with_market`, propagating any rejection as an error so the driver
+/// only ever proceeds from an engine-accepted state.
+fn seed_underwater_position(eng: &mut Engine, account: u8, asset: u8) -> Result<(), V16Error> {
+    let ai = asset as usize;
+
+    // Group-header bookkeeping the underwater leg requires.
+    eng.mh.vault = V16PodU128::new(eng.mh.vault.get().saturating_add(50));
+    eng.mh.insurance = V16PodU128::new(eng.mh.insurance.get().saturating_add(50));
+    eng.mh.negative_pnl_account_count =
+        V16PodU64::new(eng.mh.negative_pnl_account_count.get().saturating_add(1));
+
+    // Asset-level open interest / loss-weight / position-count totals: two longs
+    // and two shorts of POS_SCALE each (the account contributes one long leg).
+    let mut asset_rt = eng.mk[ai].engine.asset.try_to_runtime()?;
+    asset_rt.oi_eff_long_q = 2 * POS_SCALE;
+    asset_rt.oi_eff_short_q = 2 * POS_SCALE;
+    asset_rt.loss_weight_sum_long = 2 * POS_SCALE;
+    asset_rt.loss_weight_sum_short = 2 * POS_SCALE;
+    asset_rt.stored_pos_count_long = 2;
+    asset_rt.stored_pos_count_short = 2;
+    eng.mk[ai].engine.asset = AssetStateV16Account::from_runtime(&asset_rt);
+
+    // The account: negative PnL plus one open long leg snapped to the asset.
+    let acct = &mut eng.accts[account as usize];
+    acct.pnl = V16PodI128::new(acct.pnl.get().saturating_add(-5));
+    acct.legs[0] = PortfolioLegV16Account::from_runtime(&PortfolioLegV16 {
+        active: true,
+        asset_index: ai as u32,
+        market_id: asset_rt.market_id,
+        side: SideV16::Long,
+        basis_pos_q: POS_SCALE as i128,
+        a_basis: ADL_ONE,
+        k_snap: asset_rt.k_long,
+        f_snap: asset_rt.f_long_num,
+        epoch_snap: asset_rt.epoch_long,
+        loss_weight: POS_SCALE,
+        b_snap: asset_rt.b_long_num,
+        b_rem: 0,
+        b_epoch_snap: asset_rt.epoch_long,
+        b_stale: false,
+        stale: false,
+    });
+    acct.active_bitmap[0] = V16PodU64::new(1);
+
+    // Only proceed from a state the engine itself accepts.
+    let mv = MarketGroupV16ViewMut::new(&mut eng.mh, &mut eng.mk);
+    mv.validate_shape()?;
+    let av = PortfolioV16ViewMut::new(
+        &mut eng.accts[account as usize],
+        &mut eng.domains[account as usize],
+    );
+    av.validate_with_market(&mv.as_view())?;
+    Ok(())
 }
 
 /// A campaign that drives the engine into a state with a NON-ZERO
@@ -481,6 +598,35 @@ pub fn lien_creating_campaign() -> Scenario {
     }
 }
 
+/// A campaign that drives a REAL liquidation: it seeds an engine-accepted
+/// underwater position (via [`Action::SeedUnderwaterPosition`], which mirrors the
+/// engine's own `v16_public_liquidation_on_unfunded_domain_cannot_drain_shared_insurance`
+/// fixture) and then liquidates a non-zero `close_q` of it. The liquidation must
+/// progress by booking residual loss (`residual_booked > 0`) without draining
+/// shared insurance (`insurance_used == 0`) — the non-vacuity the
+/// `tests/liquidation.rs` gate pins.
+pub fn liquidation_campaign() -> Scenario {
+    use crate::scenario::Action::*;
+    Scenario {
+        n_markets: 1,
+        n_accounts: 1,
+        actions: vec![
+            // Construct the underwater state the engine accepts.
+            SeedUnderwaterPosition {
+                account: 0,
+                asset: 0,
+            },
+            // Close the full POS_SCALE long leg: a genuine liquidation that books
+            // residual on the unfunded domain.
+            Liquidate {
+                account: 0,
+                asset: 0,
+                close_q: POS_SCALE,
+            },
+        ],
+    }
+}
+
 /// Execute a scenario, returning a [`Trace`] with one [`Observation`] per action.
 pub fn run(s: &Scenario) -> Trace {
     let mut eng = Engine::new(s.n_markets, s.n_accounts);
@@ -490,8 +636,13 @@ pub fn run(s: &Scenario) -> Trace {
     let mut observations = Vec::with_capacity(s.actions.len());
 
     for (step, action) in s.actions.iter().enumerate() {
-        let result = apply(&mut eng, *action, &mut external_in, &mut external_out)
-            .map_err(|e| format!("{e:?}"));
+        // `apply` returns the liquidation outcome on a successful liquidation;
+        // split it from the `Result` recorded on the observation.
+        let (result, liquidation) =
+            match apply(&mut eng, *action, &mut external_in, &mut external_out) {
+                Ok(liq) => (Ok(()), liq),
+                Err(e) => (Err(format!("{e:?}")), None),
+            };
         // Views from apply() are out of scope here; safe to read account and
         // market-engine state.
         let accounts = eng.observe();
@@ -502,6 +653,7 @@ pub fn run(s: &Scenario) -> Trace {
             result,
             accounts,
             market_domains,
+            liquidation,
         });
     }
 

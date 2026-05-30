@@ -77,9 +77,36 @@ pub enum Action {
         asset: u8,
         claim: u128,
     },
+    /// Seed `account` into an engine-accepted UNDERWATER state on `asset`'s long
+    /// side, so a subsequent [`Action::Liquidate`] with a real `close_q` fires a
+    /// genuine liquidation that books residual loss.
+    ///
+    /// This mirrors, field for field, the underwater state the engine's OWN
+    /// conformance test
+    /// `v16_public_liquidation_on_unfunded_domain_cannot_drain_shared_insurance`
+    /// (`tests/v16_spec_tests.rs:289`) constructs: a single open long leg at
+    /// `POS_SCALE`, negative account PnL, and matching open-interest /
+    /// loss-weight / position-count totals on the asset, with `vault`,
+    /// `insurance` and `negative_pnl_account_count` set on the group header. The
+    /// driver then asks the engine to VALIDATE the resulting state
+    /// (`validate_shape` + `validate_with_market`), so this is a state the engine
+    /// itself accepts — not a stub. Liquidating it on an unfunded domain forces
+    /// the engine to book the unbacked loss as RESIDUAL rather than draining
+    /// shared insurance.
+    SeedUnderwaterPosition {
+        account: u8,
+        asset: u8,
+    },
+    /// Liquidate `close_q` of `account`'s position on `asset` via the engine's
+    /// `liquidate_account_not_atomic`. `close_q == 0` expresses "close the whole
+    /// position" intent (the engine clamps); a non-zero `close_q` against an
+    /// underwater leg (see [`Action::SeedUnderwaterPosition`]) drives a real
+    /// liquidation whose `LiquidationOutcomeV16` is captured into the
+    /// [`crate::driver::Observation`].
     Liquidate {
         account: u8,
         asset: u8,
+        close_q: u128,
     },
 }
 
@@ -180,7 +207,11 @@ impl Scenario {
                     check_acc(i, account, "")?;
                     check_asset(i, asset, "")?;
                 }
-                Action::Liquidate { account, asset } => {
+                Action::SeedUnderwaterPosition { account, asset } => {
+                    check_acc(i, account, "")?;
+                    check_asset(i, asset, "")?;
+                }
+                Action::Liquidate { account, asset, .. } => {
                     check_acc(i, account, "")?;
                     check_asset(i, asset, "")?;
                 }
