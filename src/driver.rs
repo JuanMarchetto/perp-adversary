@@ -173,11 +173,45 @@ struct Engine {
     domains: Vec<Vec<PortfolioSourceDomainV16Account>>,
 }
 
+/// The market's activation/target price (see [`Engine::new`]). Earned-state
+/// funding cranks MUST keep `effective_price == ACTIVATION_PRICE` so there is no
+/// target/effective lag to block the risk-increasing lien-drawing trade.
+pub const ACTIVATION_PRICE: u64 = 100;
+
+/// Build the market-group config. The default is the canonical public-user-fund
+/// config (`public_user_fund_with_market_slots`, funding OFF —
+/// `max_abs_funding_e9_per_slot == 0`), used by every seeded campaign.
+///
+/// `funding_enabled` switches to a config that PERMITS funding accrual, required
+/// by the v0.4 earned-lien campaign: the earned positive PnL is settled from a
+/// funding K/F delta, which `accrue_asset_to_not_atomic` rejects
+/// (`InvalidConfig`, `v16.rs:7833`) unless `max_abs_funding_e9_per_slot > 0`. The
+/// funding-enabled config keeps `maintenance_margin_bps == initial_margin_bps ==
+/// 10_000` and shifts the price-move budget down by one bps so the engine's exact
+/// solvency envelope (`validate_exact_solvency_envelope`, `v16.rs:1430`) still
+/// accepts it on its branch-2 path (`loss_budget_bps_ceil == 10_000`,
+/// `v16.rs:1486`): with `max_accrual_dt_slots == 1` and
+/// `max_abs_funding_e9_per_slot == 10_000`, the funding budget rounds up to 1 bps,
+/// so `max_price_move_bps_per_slot == 9_999` keeps the total loss budget at exactly
+/// 10_000 bps. The resulting config passes `validate_public_user_fund`
+/// (`v16.rs:1676`), so `MarketGroupV16HeaderAccount::new_dynamic` accepts it — it
+/// is a legitimate funded market, not a weakened one.
+fn engine_config(slots: u32, funding_enabled: bool) -> V16Config {
+    let mut cfg = V16Config::public_user_fund_with_market_slots(slots as u16, slots, 0, 10);
+    if funding_enabled {
+        cfg.max_abs_funding_e9_per_slot = 10_000;
+        cfg.max_accrual_dt_slots = 1;
+        cfg.min_funding_lifetime_slots = 1;
+        cfg.max_price_move_bps_per_slot = 9_999;
+    }
+    cfg
+}
+
 impl Engine {
-    fn new(n_markets: u32, n_accounts: u8) -> Self {
+    fn new(n_markets: u32, n_accounts: u8, funding_enabled: bool) -> Self {
         let slots = n_markets;
-        let init_price = 100u64;
-        let cfg = V16Config::public_user_fund_with_market_slots(slots as u16, slots, 0, 10);
+        let init_price = ACTIVATION_PRICE;
+        let cfg = engine_config(slots, funding_enabled);
         let mut mh = MarketGroupV16HeaderAccount::new_dynamic([1u8; 32], cfg, slots, 0).unwrap();
         let mut mk = (0..slots)
             .map(|i| Market::new(i as u64, EngineAssetSlotV16Account::default()))
@@ -432,6 +466,53 @@ fn apply(
                 asset_index: asset as usize,
                 effective_price,
                 funding_rate_e9: 0,
+                action: PermissionlessCrankActionV16::Refresh,
+            };
+            mv.permissionless_crank_not_atomic(&mut av, req)?;
+            Ok(StepOutcome::default())
+        }
+        Action::ProviderPostClaim { asset, side, claim } => {
+            // v0.4 EARNED-STATE: a backing provider posts a positive source-credit
+            // claim bound PLUS matching fresh counterparty backing on the chosen
+            // domain, through the engine's PUBLIC provider entrypoints. This is the
+            // ONLY privileged-but-public op the earned campaign keeps; it writes no
+            // per-account field and no group-header total (contrast
+            // `SeedSourceClaim`). The per-account claim/PnL is EARNED via funding.
+            let claim_num = claim
+                .checked_mul(BOUND_SCALE)
+                .ok_or(V16Error::ArithmeticOverflow)?;
+            let domain = (asset as usize) * 2 + (side as usize);
+            let mut mv = MarketGroupV16ViewMut::new(&mut eng.mh, &mut eng.mk);
+            mv.add_source_positive_claim_bound_not_atomic(domain, claim_num, claim_num)?;
+            // expiry must exceed current_slot; use u64::MAX so the backing never
+            // expires across the campaign's funding cranks.
+            mv.add_fresh_counterparty_backing_not_atomic(domain, claim_num, u64::MAX)?;
+            Ok(StepOutcome::default())
+        }
+        Action::AccrueFunding {
+            account,
+            asset,
+            now_slot,
+            effective_price,
+            funding_rate_e9,
+        } => {
+            // v0.4 EARNED-STATE: a Refresh crank threading a NON-ZERO
+            // `funding_rate_e9`. Refresh first certifies the account (settling any
+            // now-stale favorable funding K/F delta into source-attributed positive
+            // PnL via `apply_signed_kf_delta_to_pnl`, `v16.rs:7197`), then accrues
+            // the asset's funding at `funding_rate_e9` for `now_slot`. With
+            // `effective_price` held at the activation/target price there is NO
+            // price walk and hence no target/effective lag.
+            let mut mv = MarketGroupV16ViewMut::new(&mut eng.mh, &mut eng.mk);
+            let mut av = PortfolioV16ViewMut::new(
+                &mut eng.accts[account as usize],
+                &mut eng.domains[account as usize],
+            );
+            let req = PermissionlessCrankRequestV16 {
+                now_slot,
+                asset_index: asset as usize,
+                effective_price,
+                funding_rate_e9,
                 action: PermissionlessCrankActionV16::Refresh,
             };
             mv.permissionless_crank_not_atomic(&mut av, req)?;
@@ -890,6 +971,117 @@ pub fn lien_creating_campaign() -> Scenario {
     }
 }
 
+/// v0.4 EARNED-STATE campaign: reach the source-credit-lien precondition through
+/// REAL engine operations rather than the direct field writes
+/// [`lien_creating_campaign`] uses via [`Action::SeedSourceClaim`].
+///
+/// What is EARNED (driven by engine logic, no direct writes):
+///   * the OPEN LEG — a real matched position from `execute_trade`
+///     ([`Action::Trade`]), not a hand-built `PortfolioLegV16Account`;
+///   * the source-attributed POSITIVE PnL — settled by the engine from a favorable
+///     FUNDING K/F delta. Each [`Action::AccrueFunding`] crank refreshes (settling
+///     any now-stale favorable delta into the long's account as source-attributed
+///     positive PnL via `apply_signed_kf_delta_to_pnl` -> `set_account_pnl_with_source`,
+///     `v16.rs:7197`/`6627`) then accrues more funding. `set_account_pnl_inner`
+///     (`v16.rs:6673`) is what raises BOTH `account.pnl` AND the per-account
+///     `source_claim_bound_num` (and the market `positive_claim_bound_num`) — all
+///     through engine logic;
+///   * the LIEN — drawn by `execute_trade`'s
+///     `create_initial_margin_source_lien_if_needed` (`v16.rs:10261`) on the final
+///     risk-increasing add.
+///
+/// What is still PROVIDER-POSTED (a legitimate public op, kept per the plan):
+///   * the MARKET-side source-credit claim + counterparty backing, via the public
+///     provider entrypoints ([`Action::ProviderPostClaim`]). It writes no
+///     per-account field; it is the credit a backing provider posts on-chain.
+///
+/// Domain choice: account 0 holds a LONG leg, whose favorable funding the engine
+/// attributes to the SHORT source-credit domain (`opposite_side(Long)`,
+/// `v16.rs:7196`), domain `asset*2+1`. So the provider backs the SHORT domain and
+/// the lien is drawn there.
+///
+/// Economics (price held at [`ACTIVATION_PRICE`] == 100, NO price walk so no
+/// target/effective lag): account 0 deposits exactly leg-1's IM (10_000 for a
+/// 100.0 position at 100), so its capital is fully committed and the later add has
+/// no free equity beyond the earned credit. A NEGATIVE `funding_rate_e9` makes the
+/// long gain ~100 PnL per settled slot; after the funding cranks the long holds
+/// several hundred atoms of source-attributed positive PnL. The final add (a 1.0
+/// position, IM 100) needs 100 of incremental IM the capital cannot cover, so the
+/// engine draws a 100-atom effective lien against the EARNED claim.
+pub fn earned_lien_campaign() -> Scenario {
+    use crate::scenario::Action::*;
+    // A LONG leg's favorable funding is attributed to the SHORT domain.
+    let short_side: u8 = 1;
+    let p = ACTIVATION_PRICE;
+    // Negative rate => f_long rises => the long books a funding GAIN (v16.rs:7892).
+    let funding_rate_e9: i128 = -10_000;
+    // Refresh-then-accrue means funding settles one crank AFTER it accrues, so a
+    // burst of slots is needed to accumulate the earned claim. Interleave both
+    // legs each slot (both must stay current for the asset to keep accruing).
+    let mut actions = vec![
+        // Counterparty funds the short legs generously (it absorbs the funding
+        // loss and the trades' short side).
+        Deposit {
+            account: 1,
+            amount: 100_000_000,
+        },
+        // The long deposits EXACTLY leg-1's IM (notional 100.0 * price 100 = 10_000
+        // at 100% IM), so its capital is fully committed by the open.
+        Deposit {
+            account: 0,
+            amount: 10_000,
+        },
+        // Open the real EARN position: long 100.0 vs short, at the activation price.
+        Trade {
+            long: 0,
+            short: 1,
+            asset: 0,
+            size_q: 100 * POS_SCALE,
+            exec_price: p,
+            fee_bps: 0,
+        },
+        // Provider posts the market-side claim + backing on the SHORT domain (the
+        // domain the long's funding gain is attributed to). 1_000 atoms backs a
+        // lien far larger than the 100 the add needs.
+        ProviderPostClaim {
+            asset: 0,
+            side: short_side,
+            claim: 1_000,
+        },
+    ];
+    // Funding cranks: accrue at a negative rate with effective == target (no lag).
+    // Six slots earn ~400 atoms of source-attributed positive PnL for the long
+    // (the first one or two slots settle nothing — refresh-then-accrue).
+    for slot in 1..=6u64 {
+        for account in [0u8, 1u8] {
+            actions.push(AccrueFunding {
+                account,
+                asset: 0,
+                now_slot: slot,
+                effective_price: p,
+                funding_rate_e9,
+            });
+        }
+    }
+    // Risk-increasing add by the long: its capital is fully committed, so the
+    // incremental IM (100) must be met by a source-credit lien drawn against the
+    // EARNED positive PnL. effective == target throughout, so the trade is not
+    // blocked by a target/effective lag.
+    actions.push(Trade {
+        long: 0,
+        short: 1,
+        asset: 0,
+        size_q: POS_SCALE,
+        exec_price: p,
+        fee_bps: 0,
+    });
+    Scenario {
+        n_markets: 1,
+        n_accounts: 2,
+        actions,
+    }
+}
+
 /// A campaign that drives a REAL liquidation: it seeds an engine-accepted
 /// underwater position (via [`Action::SeedUnderwaterPosition`], which mirrors the
 /// engine's own `v16_public_liquidation_on_unfunded_domain_cannot_drain_shared_insurance`
@@ -999,9 +1191,25 @@ pub fn adl_campaign() -> Scenario {
     }
 }
 
+/// True iff the scenario accrues funding (an [`Action::AccrueFunding`] with a
+/// non-zero rate). Such a scenario needs the funding-enabled market config (see
+/// [`engine_config`]); every seeded campaign leaves this `false` and runs on the
+/// canonical funding-off public config.
+fn scenario_needs_funding(s: &Scenario) -> bool {
+    s.actions.iter().any(|a| {
+        matches!(
+            a,
+            Action::AccrueFunding {
+                funding_rate_e9, ..
+            } if *funding_rate_e9 != 0
+        )
+    })
+}
+
 /// Execute a scenario, returning a [`Trace`] with one [`Observation`] per action.
 pub fn run(s: &Scenario) -> Trace {
-    let mut eng = Engine::new(s.n_markets, s.n_accounts);
+    let funding_enabled = scenario_needs_funding(s);
+    let mut eng = Engine::new(s.n_markets, s.n_accounts, funding_enabled);
     let n = s.n_accounts as usize;
     let mut external_in = vec![0u128; n];
     let mut external_out = vec![0u128; n];

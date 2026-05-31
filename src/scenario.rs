@@ -48,6 +48,55 @@ pub enum Action {
         now_slot: u64,
         effective_price: u64,
     },
+    /// v0.4 EARNED-STATE: a backing PROVIDER posts a positive source-credit claim
+    /// bound of `claim` (unscaled atoms) PLUS matching fresh counterparty backing
+    /// on `asset`'s `side` source-credit domain, through the engine's PUBLIC
+    /// provider entrypoints (`add_source_positive_claim_bound_not_atomic`,
+    /// `v16.rs:4909`, and `add_fresh_counterparty_backing_not_atomic`,
+    /// `v16.rs:5058`).
+    ///
+    /// Unlike [`Action::SeedSourceClaim`], this writes NO per-account field and NO
+    /// group-header total: it only raises the MARKET-side source-credit/backing
+    /// state, which is exactly what a legitimate credit provider does on-chain (the
+    /// provider op has no internal callers — `v16.rs:4909` — so this market-side
+    /// claim can ONLY be established by such a provider posting credit). The
+    /// per-account positive PnL and per-account `source_claim_bound_num` are then
+    /// EARNED separately, by the engine, through funding settlement
+    /// ([`Action::AccrueFunding`]). `side` is `0 == long domain (asset*2)` /
+    /// `1 == short domain (asset*2+1)`; a LONG leg's favorable funding is
+    /// attributed to the SHORT domain (`opposite_side`, `v16.rs:7196`), so the
+    /// provider must back that domain for the lien to draw.
+    ProviderPostClaim {
+        asset: u8,
+        side: u8,
+        claim: u128,
+    },
+    /// v0.4 EARNED-STATE: permissionless crank (`Refresh`) for one account on one
+    /// asset that ACCRUES FUNDING at `funding_rate_e9` with `effective_price`. Like
+    /// [`Action::Crank`] it routes through `permissionless_crank_not_atomic` +
+    /// `Refresh` (refresh-then-accrue), but it threads a NON-ZERO
+    /// `funding_rate_e9` so the engine accrues a funding delta into the asset's K/F
+    /// state and, on the following refresh, SETTLES the open leg's favorable K/F
+    /// delta into the account as source-attributed positive PnL
+    /// (`settle_leg_kf_effects_at_slot` -> `apply_signed_kf_delta_to_pnl` ->
+    /// `set_account_pnl_with_source`, `v16.rs:7197`).
+    ///
+    /// CRITICAL: `effective_price` is kept EQUAL to the asset's activation/target
+    /// price (no price walk), so there is NO target/effective lag — the favorable
+    /// funding raises PnL WITHOUT the lag that would otherwise block the
+    /// risk-increasing lien-drawing trade (`v16.rs:8557`). A NEGATIVE
+    /// `funding_rate_e9` raises `f_long_num`, which a LONG leg books as a GAIN
+    /// (`v16.rs:7892`/`12565`). Funding is only active when both sides carry open
+    /// interest (`balanced_exposure`, `v16.rs:403`) and the funding rate is within
+    /// the market's `max_abs_funding_e9_per_slot` config, so a funding-enabled
+    /// market config is required (see [`crate::driver`]).
+    AccrueFunding {
+        account: u8,
+        asset: u8,
+        now_slot: u64,
+        effective_price: u64,
+        funding_rate_e9: i128,
+    },
     /// Seed `account`'s positive, source-attributed PnL of `claim` (unscaled
     /// atoms) on `asset`'s long source-credit domain, plus the matching
     /// counterparty backing in the market — establishing the precondition the
@@ -280,6 +329,14 @@ impl Scenario {
                 }
                 Action::MovePrice { asset, .. } => check_asset(i, asset, "")?,
                 Action::Crank { account, asset, .. } => {
+                    check_acc(i, account, "")?;
+                    check_asset(i, asset, "")?;
+                }
+                Action::ProviderPostClaim { asset, side, .. } => {
+                    check_asset(i, asset, "")?;
+                    check_side(i, side)?;
+                }
+                Action::AccrueFunding { account, asset, .. } => {
                     check_acc(i, account, "")?;
                     check_asset(i, asset, "")?;
                 }
