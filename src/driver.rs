@@ -757,6 +757,35 @@ fn apply(
                 }),
             })
         }
+        Action::ConvertReleasedPnl { account } => {
+            // v0.7: realize released positive PnL into withdrawable capital through
+            // the engine's PUBLIC entrypoint. The engine does `capital += converted`,
+            // `pnl -= face_burn` with the vault flat (the `support_to_account_capital`
+            // flow proof, `v16.rs:10808`), runs the backing firewall
+            // (`create_and_consume_..._for_effective`, `v16.rs:6185`, fail-closed
+            // `LockActive` at `:6249` if support cannot be covered), and validates the
+            // result (`v16.rs:10828`). A mint (`converted > face_burn`) would raise
+            // claimable value with no external flow — caught by the v0.6 oracle.
+            let mut mv = MarketGroupV16ViewMut::new(&mut eng.mh, &mut eng.mk);
+            let mut av = PortfolioV16ViewMut::new(
+                &mut eng.accts[account as usize],
+                &mut eng.domains[account as usize],
+            );
+            mv.convert_released_pnl_to_capital_not_atomic(&mut av)?;
+            Ok(StepOutcome::default())
+        }
+        Action::ReleaseLiens { account } => {
+            // v0.7: release no-longer-needed source-credit liens so a lien drawn
+            // while a position was open can be cleared after the position is flat —
+            // the setup for converting against the residual liened-effective seam.
+            let mut mv = MarketGroupV16ViewMut::new(&mut eng.mh, &mut eng.mk);
+            let mut av = PortfolioV16ViewMut::new(
+                &mut eng.accts[account as usize],
+                &mut eng.domains[account as usize],
+            );
+            mv.release_account_source_credit_liens_if_unneeded_not_atomic(&mut av)?;
+            Ok(StepOutcome::default())
+        }
     }
 }
 
@@ -1184,6 +1213,162 @@ pub fn earned_lien_campaign() -> Scenario {
         size_q: POS_SCALE,
         exec_price: p,
         fee_bps: 0,
+    });
+    Scenario {
+        n_markets: 1,
+        n_accounts: 2,
+        actions,
+    }
+}
+
+/// v0.6 — a funding-only campaign that drives the engine through its
+/// NON-VALUE-CONSERVATIVE funding settlement. Two well-capitalized accounts open a
+/// matched position of `size_q` and then run `slots` epochs, each cranking BOTH
+/// legs so each settles its own funding K/F delta in a SEPARATE
+/// `permissionless_crank` (`settle_leg_kf_effects_at_slot`, `v16.rs:7179`).
+///
+/// When `size_q` is NOT a whole multiple of `POS_SCALE` (a fractional basis), the
+/// per-leg settlement magnitude `funding_delta * |basis| / (a_basis * POS_SCALE)`
+/// has a nonzero remainder, so `floor_div_signed_conservative_i128`
+/// (`wide_math.rs:1433-1447`) truncates the RECEIVER's gain to `q` (`net > 0` branch,
+/// `v16.rs:7194-7197`) while rounding the PAYER's loss to `q+1` (`net < 0` branch,
+/// `v16.rs:7198-7208`, whose `reserve_new_capital_backed_loss` debits capital by the
+/// rounded magnitude, `v16.rs:6998`/`7028`). Because the two legs settle in separate
+/// instructions, no per-instruction `TokenValueFlowProof` spans both, so the
+/// asymmetry is never caught: each settled slot permanently destroys exactly one
+/// quote atom of claimable value (`Σ capital + Σ pnl`) with the vault flat and the
+/// dust credited to NO sink — violating spec req #14 (the
+/// `SettlementRoundingResidue`/`UnallocatedProtocolSurplus` sink fields do not exist
+/// in the live `MarketGroupV16HeaderAccount`, `v16.rs:4057-4091`) and undetectable at
+/// runtime (`StockReconciliationProofV16`, `v16.rs:3019`, is never constructed).
+///
+/// A whole-multiple `size_q` (no remainder) conserves claimable value exactly — the
+/// `tests/funding_conservation.rs` causation arm pins clean-vs-fractional. The
+/// per-slot leak is permanent and monotone, so it scales with `slots` (a constant
+/// settlement-lag offset does not) — the discriminator the oracle relies on.
+///
+/// The campaign is REACHABLE with no field-writes: real `Deposit` + `Trade` + a
+/// `ProviderPostClaim` (the engine's PUBLIC backing-provider entrypoint, no internal
+/// callers — `v16.rs:4909`) + `AccrueFunding` cranks. The provider claim backs the
+/// receiver domain (a long leg's funding is attributed to the SHORT domain,
+/// `opposite_side(Long)`, `v16.rs:7196`) so the long books its full floored gain
+/// every slot and the leak grows WITHOUT BOUND instead of capping at the receiver's
+/// unbacked source-realizability support. The provider op injects no quote value
+/// into the conservation measure (net external flow stays exactly the deposits).
+pub fn funding_leak_campaign(size_q: u128, slots: u64) -> Scenario {
+    use crate::scenario::Action::*;
+    let p = ACTIVATION_PRICE;
+    // Negative rate => f_long rises => the long is the funding RECEIVER (gains),
+    // the short is the PAYER (loses). Both legs are cranked each slot so both settle.
+    let funding_rate_e9: i128 = -9_999;
+    let big = 1_000_000_000u128; // both accounts over-funded: no haircut/bankruptcy branch.
+    let mut actions = vec![
+        Deposit { account: 0, amount: big },
+        Deposit { account: 1, amount: big },
+        Trade {
+            long: 0,
+            short: 1,
+            asset: 0,
+            size_q,
+            exec_price: p,
+            fee_bps: 0,
+        },
+        // Back the RECEIVER domain (a long leg's funding is attributed to the SHORT
+        // domain, opposite_side(Long)) so the long can book its full floored gain
+        // indefinitely (no source-realizability haircut) — the leak then grows
+        // without bound instead of capping at the receiver's unbacked support.
+        ProviderPostClaim { asset: 0, side: 1, claim: 1_000_000_000 },
+    ];
+    for slot in 1..=slots {
+        for account in [0u8, 1u8] {
+            actions.push(AccrueFunding {
+                account,
+                asset: 0,
+                now_slot: slot,
+                effective_price: p,
+                funding_rate_e9,
+            });
+        }
+    }
+    Scenario {
+        n_markets: 1,
+        n_accounts: 2,
+        actions,
+    }
+}
+
+/// v0.7 — drive the engine's PnL→capital REALIZATION firewall end-to-end. A long
+/// earns funding PnL (as in [`funding_leak_campaign`]), then FLATTENS its leg (a
+/// closing trade) so it carries released positive PnL with NO active exposure,
+/// releases any liens, re-certifies, and calls
+/// [`Action::ConvertReleasedPnl`] — the engine's public
+/// `convert_released_pnl_to_capital_not_atomic` (`v16.rs:10821`), the ONLY path that
+/// turns PnL into withdrawable `capital`. Finally it `Withdraw`s part of the
+/// realized capital.
+///
+/// This exercises the backing firewall
+/// (`create_and_consume_account_source_credit_for_effective_not_atomic`,
+/// `v16.rs:6185`) that every "winner overdraws realizable PnL" extraction theory
+/// gated on but the harness never reached. Convert does `capital += converted`,
+/// `pnl -= face_burn` with the vault flat, so the v0.6 claimable oracle catches any
+/// MINT (`converted > face_burn` ⇒ `ClaimableValueCreated`, the extractive
+/// direction). In the pinned engine the convert conserves claimable value EXACTLY
+/// (`converted == face_burn`), so the firewall holds — now TESTED, not argued.
+pub fn convert_realization_campaign() -> Scenario {
+    use crate::scenario::Action::*;
+    let p = ACTIVATION_PRICE;
+    let size_q = 100 * POS_SCALE + 1; // fractional basis: also carries the v0.6 leak
+    let big = 1_000_000_000u128;
+    let mut actions = vec![
+        Deposit { account: 0, amount: big },
+        Deposit { account: 1, amount: big },
+        Trade {
+            long: 0,
+            short: 1,
+            asset: 0,
+            size_q,
+            exec_price: p,
+            fee_bps: 0,
+        },
+        // Back the receiver (short) domain so the long books its full funding gain.
+        ProviderPostClaim {
+            asset: 0,
+            side: 1,
+            claim: big,
+        },
+    ];
+    for slot in 1..=6u64 {
+        for account in [0u8, 1u8] {
+            actions.push(AccrueFunding {
+                account,
+                asset: 0,
+                now_slot: slot,
+                effective_price: p,
+                funding_rate_e9: -9_999,
+            });
+        }
+    }
+    // Flatten the long's leg (it sells the same size back), release liens, re-certify
+    // at a fresh slot, then REALIZE the released PnL into capital and withdraw part.
+    actions.push(Trade {
+        long: 1,
+        short: 0,
+        asset: 0,
+        size_q,
+        exec_price: p,
+        fee_bps: 0,
+    });
+    actions.push(ReleaseLiens { account: 0 });
+    actions.push(Crank {
+        account: 0,
+        asset: 0,
+        now_slot: 7,
+        effective_price: p,
+    });
+    actions.push(ConvertReleasedPnl { account: 0 });
+    actions.push(Withdraw {
+        account: 0,
+        amount: 300,
     });
     Scenario {
         n_markets: 1,

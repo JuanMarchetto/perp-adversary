@@ -1266,3 +1266,206 @@ pub fn check_step_value_conservation(
 ) -> Result<(), Violation> {
     value_conservation(prev, cur, cur.ext_in_step, cur.ext_out_step)
 }
+
+// =============================================================================
+// v0.6 — FUNDING CLAIMABLE-VALUE CONSERVATION (an EMERGENT, engine-UNCHECKED red)
+// =============================================================================
+//
+// THE FINDING (a CANDIDATE red, triaged below): funding settlement is NOT
+// value-conservative for a fractional-basis position. Funding is economically a
+// ZERO-SUM transfer — what the payer leg loses, the receiver leg gains — so the
+// total CLAIMABLE value `M = Σ (account.capital + account.pnl)` over all accounts
+// MUST be invariant under any funding settlement (a step with no external flow).
+//
+// The engine breaks this by a FLOOR/CEIL ASYMMETRY. The two legs of a matched
+// position settle their funding K/F deltas in SEPARATE `permissionless_crank`
+// instructions (`settle_leg_kf_effects_at_slot`, `v16.rs:7179`):
+//   * the RECEIVER leg (`net > 0`, `v16.rs:7194-7197`) credits PnL by
+//     `floor_div_signed_conservative_i128(+x) = ⌊x⌋ = q` (truncates down,
+//     `wide_math.rs:1435`);
+//   * the PAYER leg (`net < 0`, `v16.rs:7198-7208`) debits CAPITAL by
+//     `|floor_div_signed_conservative_i128(−x)| = ⌈x⌉ = q+1` (rounds away from
+//     zero, `wide_math.rs:1441`) via `reserve_new_capital_backed_loss` (`v16.rs:6998`,
+//     `c_tot -= q+1` at `:7028`).
+// When the per-leg magnitude `x = funding_delta·|basis| / (a_basis·POS_SCALE)` has a
+// nonzero remainder (a FRACTIONAL basis), `⌈x⌉ − ⌊x⌋ = 1`: the payer loses one MORE
+// atom than the receiver gains. `M` falls by exactly 1 per settled slot. The vault
+// is UNTOUCHED (funding moves no tokens), so the destroyed atom becomes permanent,
+// unattributable vault slack.
+//
+// WHY THE ENGINE NEVER CATCHES IT:
+//   * No per-instruction `TokenValueFlowProof` spans BOTH legs (they settle in
+//     separate cranks), and each leg's own proof balances against the flat vault.
+//   * The destroyed atom is credited to NO sink, violating spec req #14 (`spec.md:47`:
+//     conservative-rounding residue MUST be credited to `SettlementRoundingResidue`
+//     or `UnallocatedProtocolSurplus`). Those two sink fields HAVE NO STORAGE in the
+//     live `MarketGroupV16HeaderAccount` (`v16.rs:4057-4091`) — they exist only as
+//     fields of `StockReconciliationProofV16` (`v16.rs:3019-3025`).
+//   * `StockReconciliationProofV16` (`v16.rs:3019`/`3028`, the ONLY object binding the
+//     partition equality `vault == Σ stock classes`) is DEAD CODE — zero construction
+//     sites in `src/` or `tests/`. So nothing reconciles the growing slack.
+//   * v0.5 vault conservation stays GREEN (the vault never moves), so this is a
+//     genuinely DISTINCT, emergent invariant.
+//
+// TRIAGE / HONEST LIMITS: the leak is NON-EXTRACTIVE — the rounding is uniformly
+// conservative (always FOR the protocol), so the slack accrues to the protocol as
+// over-collateralization; no user gains. It is one atom per settled fractional slot,
+// but it is PERMANENT, MONOTONE and UNBOUNDED across epochs and fractional-basis
+// legs. So a red here is a CANDIDATE to triage (a real conservation/req#14 break vs
+// an accepted conservative-rounding policy), never a confirmed exploit. A reviewer
+// could argue the conservative direction is intended; the rebuttal is that req #14
+// mandates an EXPLICIT sink via a balanced flow proof and `spec.md:28` says
+// unattributed rounding residue MUST roll the instruction back — neither happens,
+// and the engine cannot even account for the accumulated slack.
+//
+// LAG vs LEAK (why the demonstration differences two campaign lengths): funding
+// settlement lags accrual by one refresh (refresh-then-accrue), so at any snapshot
+// one slot of funding is "in flight" (payer debited, receiver not yet credited).
+// That produces a BOUNDED, CONSTANT shortfall offset that does NOT grow with the
+// campaign length. The LEAK is the part that grows by exactly 1 per added settled
+// fractional slot. `tests/funding_conservation.rs` isolates the leak by differencing
+// shortfalls across lengths (and clean-vs-fractional bases), so the signal can never
+// be confused with the benign lag.
+
+/// Total CLAIMABLE value of an observation: `Σ (capital + pnl)` over all accounts,
+/// in quote atoms (i128, since `pnl` is signed). This is the quantity a funding
+/// settlement — a pure transfer between accounts — MUST conserve. Saturating-free:
+/// real engine magnitudes are far below the i128 range.
+pub fn claimable_value(obs: &Observation) -> i128 {
+    obs.accounts
+        .iter()
+        .map(|a| a.capital as i128 + a.pnl)
+        .sum()
+}
+
+/// Which direction the funding claimable-value conservation broke. `Copy` and
+/// allocation-free so the soundness proof can reason about the predicate without
+/// modelling string formatting (same discipline as [`ViolationKind`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FundingConservationKind {
+    /// Claimable value (`Σ capital + Σ pnl`) FELL by more than the net external
+    /// outflow — value was DESTROYED (the funding floor/ceil leak), or legitimately
+    /// left unaccounted.
+    ClaimableValueDestroyed,
+    /// Claimable value ROSE by more than the net external inflow — value was created
+    /// from nowhere (the EXTRACTIVE direction; not expected from conservative funding).
+    ClaimableValueCreated,
+}
+
+impl FundingConservationKind {
+    /// The spec/engine citation this breaks.
+    pub fn requirement(self) -> &'static str {
+        "funding value conservation (spec.md:47 req#14 rounding-residue sink; \
+         floor/ceil asymmetry wide_math.rs:1441 vs :1435; StockReconciliation dead v16.rs:3019)"
+    }
+}
+
+/// FUNDING CLAIMABLE-VALUE CONSERVATION arithmetic core: allocation-free, pure,
+/// fail-closed. Over a window, claimable value must change by EXACTLY the net
+/// external flow that crossed the boundary:
+///
+/// ```text
+/// cur_claimable − prev_claimable == ext_in − ext_out
+/// ```
+///
+/// Returns `Ok(())` iff balanced, else the breach direction. Reasoned about by the
+/// companion Kani proof. It balances the equation as the two SIGNED sides
+/// `prev_claimable + ext_in == cur_claimable + ext_out` via `i128` checked
+/// arithmetic, never forming an intermediate that could overflow/wrap to mask a
+/// breach (fail-closed to the worst case on overflow, exactly like
+/// [`value_conservation_kind`]).
+#[inline]
+pub fn funding_conservation_kind(
+    prev_claimable: i128,
+    cur_claimable: i128,
+    ext_in: u128,
+    ext_out: u128,
+) -> Result<(), FundingConservationKind> {
+    // External flow magnitudes are small, non-negative quote-atom counts; if either
+    // cannot be represented as i128 the measure is untrustworthy — fail closed to
+    // "value destroyed" (the conservative worst case for a leak hunt).
+    let ext_in_i = match i128::try_from(ext_in) {
+        Ok(v) => v,
+        Err(_) => return Err(FundingConservationKind::ClaimableValueDestroyed),
+    };
+    let ext_out_i = match i128::try_from(ext_out) {
+        Ok(v) => v,
+        Err(_) => return Err(FundingConservationKind::ClaimableValueDestroyed),
+    };
+    // Compare prev + ext_in  vs  cur + ext_out (algebraically identical to the
+    // displayed equation). checked_add fails closed rather than wrapping.
+    let lhs = prev_claimable.checked_add(ext_in_i);
+    let rhs = cur_claimable.checked_add(ext_out_i);
+    match (lhs, rhs) {
+        (Some(l), Some(r)) if l == r => Ok(()),
+        // lhs > rhs ⇒ prev + ext_in > cur + ext_out ⇒ claimable fell below the net
+        // inflow: value DESTROYED (the funding leak).
+        (Some(l), Some(r)) if l > r => Err(FundingConservationKind::ClaimableValueDestroyed),
+        // lhs < rhs ⇒ claimable rose beyond the net inflow: value CREATED.
+        (Some(l), Some(r)) if l < r => Err(FundingConservationKind::ClaimableValueCreated),
+        // An addition overflowed (impossible for real bounded magnitudes). Fail
+        // closed to the worst case.
+        _ => Err(FundingConservationKind::ClaimableValueDestroyed),
+    }
+}
+
+/// v0.6 FUNDING CLAIMABLE-VALUE CONSERVATION oracle over a window `(prev, cur)`:
+/// claimable value (`Σ capital + Σ pnl`) must change by EXACTLY the net external
+/// flow `ext_in − ext_out`. Pure and fail-closed; wraps [`funding_conservation_kind`].
+///
+/// NOTE: funding is zero-sum only across BOTH legs of a position, which settle in
+/// SEPARATE cranks, so this is meaningless per single-step pair (it would flag the
+/// payer's and receiver's individual cranks, and the benign settlement-lag). Apply
+/// it over a WHOLE funding sub-campaign window (`prev` = the empty/baseline state,
+/// `cur` = the campaign end) — see [`claimable_shortfall`] and
+/// `tests/funding_conservation.rs`, which difference lengths to isolate the
+/// permanent leak from the bounded lag.
+pub fn funding_value_conservation(
+    prev: &Observation,
+    cur: &Observation,
+    ext_in: u128,
+    ext_out: u128,
+) -> Result<(), Violation> {
+    funding_conservation_kind(claimable_value(prev), claimable_value(cur), ext_in, ext_out).map_err(
+        |kind| Violation {
+            requirement: kind.requirement(),
+            detail: match kind {
+                FundingConservationKind::ClaimableValueDestroyed => format!(
+                    "claimable value Σ(capital+pnl) {} -> {} but net external flow was +{ext_in}/-{ext_out}: \
+                     {} atoms DESTROYED (funding floor/ceil leak to unattributable vault slack; no req#14 sink)",
+                    claimable_value(prev),
+                    claimable_value(cur),
+                    (claimable_value(prev) + ext_in as i128) - (claimable_value(cur) + ext_out as i128),
+                ),
+                FundingConservationKind::ClaimableValueCreated => format!(
+                    "claimable value Σ(capital+pnl) {} -> {} but net external flow was +{ext_in}/-{ext_out}: \
+                     value CREATED beyond external inflow (extractive direction)",
+                    claimable_value(prev),
+                    claimable_value(cur),
+                ),
+            },
+        },
+    )
+}
+
+/// The claimable-value SHORTFALL over a whole trace: the net external flow that
+/// entered the instance minus the claimable value (`Σ capital + Σ pnl`) actually
+/// present at the end. The system starts empty (`M == 0`), so under conservation
+/// `M_final == Σ ext_in − Σ ext_out`; a POSITIVE shortfall means that many quote
+/// atoms of claimable value were DESTROYED (left all accounts without leaving via a
+/// withdrawal) — the funding leak plus the bounded in-flight settlement lag.
+///
+/// `tests/funding_conservation.rs` differences this across campaign lengths and
+/// clean-vs-fractional bases to isolate the PERMANENT, length-proportional LEAK from
+/// the CONSTANT lag. Returns `(expected_net_external_in, claimable_final, shortfall)`.
+pub fn claimable_shortfall(observations: &[Observation]) -> (i128, i128, i128) {
+    let mut cum_in: i128 = 0;
+    let mut cum_out: i128 = 0;
+    for o in observations {
+        cum_in += o.ext_in_step as i128;
+        cum_out += o.ext_out_step as i128;
+    }
+    let net_ext = cum_in - cum_out;
+    let m_final = observations.last().map(claimable_value).unwrap_or(0);
+    (net_ext, m_final, net_ext - m_final)
+}
