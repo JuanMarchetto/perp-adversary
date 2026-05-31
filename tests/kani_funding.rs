@@ -107,4 +107,16 @@ fn funding_floor_ceil_asymmetry_destroys_remainder() {
         // Fractional basis: payer pays ceil = q+1, receiver gets floor = q.
         assert!(destroyed == 1);
     }
+    // NOTE on the funding settlement path: `leg_kf_delta_for_settlement` (v16.rs:7129)
+    // floors each leg's net in one of two ways, BOTH rounding toward -inf identically:
+    //   * fast path `scaled_adl_delta_fast` (v16.rs:12557), taken when a_basis==ADL_ONE
+    //     (legs default to ADL_ONE, v16.rs:2390), which calls THIS function
+    //     `floor_div_signed_conservative_i128` at v16.rs:12572 — so this proof covers
+    //     the real fast-path primitive;
+    //   * the wide fallback `wide_signed_mul_div_floor_from_k_pair` (wide_math.rs:1630),
+    //     whose negative branch rounds the magnitude up (q+1) at wide_math.rs:1654-1666
+    //     and positive branch truncates at :1667 — the identical rule, verified by
+    //     reading (its U256 internals make it intractable for Kani). The runtime test
+    //     `tests/funding_conservation.rs` drives whichever path the engine takes and
+    //     measures the resulting 1-atom/slot leak directly.
 }

@@ -3,11 +3,13 @@
 //! Funding is economically a zero-sum transfer, so total claimable value
 //! `M = Σ (capital + pnl)` over all accounts MUST be invariant under any funding
 //! settlement (no external flow). The engine breaks this for a FRACTIONAL-basis
-//! position: the receiver leg credits PnL by `⌊x⌋` while the payer leg debits
-//! capital by `⌈x⌉` (the floor/ceil asymmetry of `floor_div_signed_conservative_i128`,
-//! the two legs settling in SEPARATE cranks), destroying exactly one quote atom of
-//! claimable value per settled slot — to unattributable vault slack, with no req#14
-//! sink, undetected (`StockReconciliationProofV16` is dead). See `oracles.rs` v0.6.
+//! position: the receiver leg credits PnL by `⌊x⌋` while the payer leg debits PnL by
+//! `⌈x⌉` (the floor/ceil asymmetry of `wide_signed_mul_div_floor_from_k_pair`,
+//! `wide_math.rs:1630`, reached from `leg_kf_delta_for_settlement`, `v16.rs:7129`; the
+//! two legs settle the same magnitude in SEPARATE cranks), destroying exactly one
+//! quote atom of claimable value per settled slot — to unattributable vault slack,
+//! with no req#14 sink, undetected (`StockReconciliationProofV16` is dead). See
+//! `oracles.rs` v0.6.
 //!
 //! These tests (a) confirm the campaign is NON-VACUOUS (funding really settles and
 //! the vault stays flat, so v0.5 vault conservation cannot see it), and (b) ISOLATE
