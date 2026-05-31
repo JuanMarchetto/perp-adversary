@@ -5,13 +5,14 @@
 //! only AFTER the engine views (which mutably borrow the accounts) are dropped.
 use crate::scenario::{Action, Scenario};
 use percolator::v16::{
-    v16_domain_count_for_market_slots, AssetStateV16Account, EngineAssetSlotV16Account,
-    LiquidationOutcomeV16, LiquidationRequestV16, Market, MarketGroupV16HeaderAccount,
-    MarketGroupV16ViewMut, PermissionlessCrankActionV16, PermissionlessCrankRequestV16,
-    PortfolioAccountV16Account, PortfolioLegV16, PortfolioLegV16Account,
-    PortfolioSourceDomainV16Account, PortfolioV16ViewMut, ProvenanceHeaderV16,
-    ProvenanceHeaderV16Account, SideV16, SourceCreditStateV16Account, TradeRequestV16, V16Config,
-    V16Error, V16PodI128, V16PodU128, V16PodU64,
+    v16_domain_count_for_market_slots, AssetStateV16Account, CloseProgressLedgerV16,
+    CloseProgressLedgerV16Account, EngineAssetSlotV16Account, LiquidationOutcomeV16,
+    LiquidationRequestV16, Market, MarketGroupV16HeaderAccount, MarketGroupV16ViewMut,
+    PermissionlessCrankActionV16, PermissionlessCrankRequestV16, PortfolioAccountV16Account,
+    PortfolioLegV16, PortfolioLegV16Account, PortfolioSourceDomainV16Account, PortfolioV16ViewMut,
+    ProvenanceHeaderV16, ProvenanceHeaderV16Account, QuantityAdlOutcomeV16, SideV16,
+    SourceCreditStateV16Account, TradeRequestV16, V16Config, V16Error, V16PodI128, V16PodU128,
+    V16PodU64,
 };
 use percolator::{ADL_ONE, POS_SCALE};
 
@@ -49,6 +50,16 @@ pub struct AccountObs {
     pub pnl: i128,
     pub fee_credits: i128,
     pub domains: Vec<DomainObs>,
+    /// The account's `close_progress.quantity_adl_applied_q` ledger value
+    /// (`CloseProgressLedgerV16Account::quantity_adl_applied_q`,
+    /// `percolator-ref/src/v16.rs:11920`), read straight from the engine slot via
+    /// `.get()` exactly as the engine reads it (`v16.rs:2134`). The engine's ADL
+    /// entrypoint advances this to the closed quantity inside
+    /// `advance_close_progress_quantity_adl` (`v16.rs:9533`). Surfacing it on EVERY
+    /// observation (not just the ADL step) lets the v0.3-B accounting oracle
+    /// compare the value BEFORE and AFTER an `ApplyAdl` step — the cross-step delta
+    /// it polices. On a non-ADL state this is `0`.
+    pub quantity_adl_applied_q: u128,
 }
 
 /// Observable MARKET-ENGINE source-credit state, mirroring `SourceCreditStateV16`
@@ -109,6 +120,26 @@ pub struct LiquidationObs {
     pub fee_charged: u128,
 }
 
+/// Observable result of a single
+/// `apply_quantity_adl_after_residual_for_account_not_atomic` call, mirroring the
+/// engine's `QuantityAdlOutcomeV16` (`percolator-ref/src/v16.rs:3178`). Present on
+/// an [`Observation`] iff that step was an [`Action::ApplyAdl`] the engine
+/// accepted.
+///
+/// `quantity_adl_applied_q` is the account's post-ADL
+/// `close_progress.quantity_adl_applied_q` (read via
+/// `CloseProgressLedgerV16Account::try_to_runtime`): the engine advances this to
+/// the closed quantity inside `advance_close_progress_quantity_adl`
+/// (`v16.rs:9517`), so the v0.3-B accounting oracle can police that the ledger's
+/// applied quantity equals the outcome's `closed_q`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AdlObs {
+    pub closed_q: u128,
+    pub opposite_a_after: u128,
+    pub reset_started: bool,
+    pub quantity_adl_applied_q: u128,
+}
+
 #[derive(Clone, Debug)]
 pub struct Observation {
     pub step: usize,
@@ -120,6 +151,9 @@ pub struct Observation {
     /// The `LiquidationOutcomeV16` captured when this step was an
     /// [`Action::Liquidate`] the engine accepted; `None` otherwise.
     pub liquidation: Option<LiquidationObs>,
+    /// The `QuantityAdlOutcomeV16` captured when this step was an
+    /// [`Action::ApplyAdl`] the engine accepted; `None` otherwise.
+    pub adl: Option<AdlObs>,
 }
 
 #[derive(Clone, Debug)]
@@ -191,6 +225,10 @@ impl Engine {
                 pnl: acct.pnl.get(),
                 fee_credits: acct.fee_credits.get(),
                 domains: doms.iter().map(read_domain).collect(),
+                // The close-progress ledger's applied-ADL quantity, read directly
+                // via `.get()` as the engine does (v16.rs:2134). 0 until an ADL
+                // advances it (v16.rs:9533).
+                quantity_adl_applied_q: acct.close_progress.quantity_adl_applied_q.get(),
             })
             .collect()
     }
@@ -296,17 +334,27 @@ fn disjoint_two<'a>(
     }
 }
 
+/// Per-step engine outcomes captured for the step's [`Observation`]. Both fields
+/// are `None` for actions that produce neither a liquidation nor an ADL.
+#[derive(Clone, Copy, Debug, Default)]
+struct StepOutcome {
+    liquidation: Option<LiquidationObs>,
+    adl: Option<AdlObs>,
+}
+
 /// Apply a single action to the engine, threading external-flow tallies.
 /// Engine views constructed here are dropped before the caller observes state.
-/// Returns the `LiquidationOutcomeV16` (as a [`LiquidationObs`]) when the action
-/// is a liquidation the engine accepted, so [`run`] can record it on the step's
-/// [`Observation`]; all other actions return `Ok(None)`.
+/// Returns a [`StepOutcome`]: the `LiquidationOutcomeV16` (as a [`LiquidationObs`])
+/// when the action is a liquidation the engine accepted, or the
+/// `QuantityAdlOutcomeV16` (as an [`AdlObs`]) when the action is an ADL the engine
+/// accepted, so [`run`] can record it on the step's [`Observation`]; all other
+/// actions return the default (both `None`).
 fn apply(
     eng: &mut Engine,
     action: Action,
     ext_in: &mut [u128],
     ext_out: &mut [u128],
-) -> Result<Option<LiquidationObs>, V16Error> {
+) -> Result<StepOutcome, V16Error> {
     match action {
         Action::Deposit { account, amount } => {
             let mut mv = MarketGroupV16ViewMut::new(&mut eng.mh, &mut eng.mk);
@@ -316,7 +364,7 @@ fn apply(
             );
             mv.deposit_not_atomic(&mut av, amount)?;
             ext_in[account as usize] = ext_in[account as usize].saturating_add(amount);
-            Ok(None)
+            Ok(StepOutcome::default())
         }
         Action::Withdraw { account, amount } => {
             let mut mv = MarketGroupV16ViewMut::new(&mut eng.mh, &mut eng.mk);
@@ -326,7 +374,7 @@ fn apply(
             );
             mv.withdraw_not_atomic(&mut av, amount)?;
             ext_out[account as usize] = ext_out[account as usize].saturating_add(amount);
-            Ok(None)
+            Ok(StepOutcome::default())
         }
         Action::Trade {
             long,
@@ -352,7 +400,7 @@ fn apply(
                 fee_bps,
             };
             mv.execute_trade_with_fee_in_place_not_atomic(&mut lv, &mut sv, req)?;
-            Ok(None)
+            Ok(StepOutcome::default())
         }
         Action::MovePrice {
             asset,
@@ -361,7 +409,7 @@ fn apply(
         } => {
             let mut mv = MarketGroupV16ViewMut::new(&mut eng.mh, &mut eng.mk);
             mv.accrue_asset_to_not_atomic(asset as usize, now_slot, effective_price, 0, false)?;
-            Ok(None)
+            Ok(StepOutcome::default())
         }
         Action::Crank {
             account,
@@ -387,7 +435,7 @@ fn apply(
                 action: PermissionlessCrankActionV16::Refresh,
             };
             mv.permissionless_crank_not_atomic(&mut av, req)?;
-            Ok(None)
+            Ok(StepOutcome::default())
         }
         Action::SeedSourceClaim {
             account,
@@ -436,11 +484,11 @@ fn apply(
                 );
                 av.validate_with_market(&mv.as_view())?;
             }
-            Ok(None)
+            Ok(StepOutcome::default())
         }
         Action::SeedUnderwaterPosition { account, asset } => {
             seed_underwater_position(eng, account, asset, 0)?;
-            Ok(None)
+            Ok(StepOutcome::default())
         }
         Action::SeedUnderwaterPositionFunded {
             account,
@@ -448,7 +496,7 @@ fn apply(
             domain_budget,
         } => {
             seed_underwater_position(eng, account, asset, domain_budget)?;
-            Ok(None)
+            Ok(StepOutcome::default())
         }
         Action::Liquidate {
             account,
@@ -471,14 +519,82 @@ fn apply(
                 fee_bps: 0,
             };
             let out: LiquidationOutcomeV16 = mv.liquidate_account_not_atomic(&mut av, req)?;
-            Ok(Some(LiquidationObs {
-                closed_q: out.closed_q,
-                insurance_used: out.insurance_used,
-                residual_booked: out.residual_booked,
-                explicit_loss: out.explicit_loss,
-                fee_charged: out.fee_charged,
-            }))
+            Ok(StepOutcome {
+                liquidation: Some(LiquidationObs {
+                    closed_q: out.closed_q,
+                    insurance_used: out.insurance_used,
+                    residual_booked: out.residual_booked,
+                    explicit_loss: out.explicit_loss,
+                    fee_charged: out.fee_charged,
+                }),
+                adl: None,
+            })
         }
+        Action::SeedFinalizedClose {
+            account,
+            asset,
+            bankrupt_side,
+        } => {
+            seed_finalized_close(eng, account, asset, side_from_u8(bankrupt_side))?;
+            Ok(StepOutcome::default())
+        }
+        Action::ApplyAdl {
+            account,
+            asset,
+            bankrupt_side,
+            close_q,
+        } => {
+            let mut mv = MarketGroupV16ViewMut::new(&mut eng.mh, &mut eng.mk);
+            let mut av = PortfolioV16ViewMut::new(
+                &mut eng.accts[account as usize],
+                &mut eng.domains[account as usize],
+            );
+            let out: QuantityAdlOutcomeV16 = mv
+                .apply_quantity_adl_after_residual_for_account_not_atomic(
+                    &mut av,
+                    asset as usize,
+                    side_from_u8(bankrupt_side),
+                    close_q,
+                )?;
+            // The engine advanced the account's close-progress ledger; surface its
+            // `quantity_adl_applied_q` for the v0.3-B accounting oracle. The view
+            // `av` still borrows the account here, so read through it before drop.
+            let quantity_adl_applied_q = av
+                .header
+                .close_progress
+                .try_to_runtime()?
+                .quantity_adl_applied_q;
+            Ok(StepOutcome {
+                liquidation: None,
+                adl: Some(AdlObs {
+                    closed_q: out.closed_q,
+                    opposite_a_after: out.opposite_a_after,
+                    reset_started: out.reset_started,
+                    quantity_adl_applied_q,
+                }),
+            })
+        }
+    }
+}
+
+/// Map a scenario `bankrupt_side` byte (`0 == Long`, `1 == Short`) to the engine's
+/// [`SideV16`]. [`Scenario::validate`](crate::scenario::Scenario::validate) rejects
+/// any other value at the trust boundary, so a non-`{0,1}` byte can only reach here
+/// from internal driver code; treat it as `Short`.
+fn side_from_u8(side: u8) -> SideV16 {
+    if side == 0 {
+        SideV16::Long
+    } else {
+        SideV16::Short
+    }
+}
+
+/// The engine's private `opposite_side` (`v16.rs:12443`): `Long <-> Short`.
+/// Inlined here because the engine does not export it.
+fn opposite_side(side: SideV16) -> SideV16 {
+    match side {
+        SideV16::Long => SideV16::Short,
+        SideV16::Short => SideV16::Long,
     }
 }
 
@@ -571,6 +687,144 @@ fn seed_underwater_position(
         stale: false,
     });
     acct.active_bitmap[0] = V16PodU64::new(1);
+
+    // Only proceed from a state the engine itself accepts.
+    let mv = MarketGroupV16ViewMut::new(&mut eng.mh, &mut eng.mk);
+    mv.validate_shape()?;
+    let av = PortfolioV16ViewMut::new(
+        &mut eng.accts[account as usize],
+        &mut eng.domains[account as usize],
+    );
+    av.validate_with_market(&mv.as_view())?;
+    Ok(())
+}
+
+/// Drive `account` into an engine-accepted, FINALIZED-CLOSE, ADL-eligible state on
+/// `asset` for the given `bankrupt_side`, so [`Action::ApplyAdl`] can fire a real
+/// quantity auto-deleverage.
+///
+/// The engine's ADL entrypoint
+/// `apply_quantity_adl_after_residual_for_account_not_atomic` (`v16.rs:9479`) gates
+/// on TWO things, which this seed satisfies exactly:
+///
+/// 1. The account's `close_progress` ledger is `active && finalized &&
+///    residual_remaining == 0`, with `asset_index == asset`, `market_id` equal to
+///    the asset's `market_id`, and `domain_side == opposite_side(bankrupt_side)`.
+///    The ledger body satisfies the engine-validated residual equation
+///    (`total_loss == gross + drift`; `progress == support + insurance + b_loss +
+///    explicit`; `residual == total_loss - progress`) from the engine's own
+///    `proof_v16_close_progress_ledger_residual_equation_is_enforced`
+///    (`tests/proofs_v16.rs:1716`): here `gross = support = junior_face_burned = 4`,
+///    everything else 0, so `total_loss == progress == 4` and `residual == 0`
+///    (finalized). `support_consumed <= junior_face_burned` and
+///    `drift_reference_slot <= max_close_slot` (the other ledger-shape invariants,
+///    `v16.rs:2297`) also hold.
+///
+/// 2. An ACTIVE, non-stale leg on `asset` whose `side == bankrupt_side` and whose
+///    `basis_pos_q.unsigned_abs()` the ADL `close_q` must equal. The leg mirrors the
+///    snapshot-bound shape of [`seed_underwater_position`]'s leg (a_basis `ADL_ONE`,
+///    `loss_weight == POS_SCALE`, `basis_pos_q == POS_SCALE`, snapshots taken from
+///    the asset), so `validate_active_leg` + `leg_snapshots_bound_to_asset_side`
+///    accept it. With `domain_side == opposite_side(bankrupt_side) ==
+///    opposite_side(leg.side)`, the ledger/leg cross-check at `v16.rs:2332` also
+///    passes.
+///
+/// Open interest / loss-weight / position-count totals are set to `2 * POS_SCALE`
+/// (balanced long == short, required in `Live` mode by `v16.rs:4636`) with
+/// `stored_pos_count == 2` each, so an ADL `close_q == POS_SCALE` reduces both
+/// sides to `POS_SCALE` (still > 0, so neither side hits a full-drain reset) and
+/// `opposite_a_after == ADL_ONE / 2`, which stays above `MIN_A_SIDE`. The function
+/// then runs `validate_shape` + `validate_with_market`, propagating any rejection,
+/// so the driver only ever proceeds from a state the engine itself accepts.
+fn seed_finalized_close(
+    eng: &mut Engine,
+    account: u8,
+    asset: u8,
+    bankrupt_side: SideV16,
+) -> Result<(), V16Error> {
+    let ai = asset as usize;
+    let domain_side = opposite_side(bankrupt_side);
+
+    // Balanced open interest / loss-weight / position-count totals: two legs each
+    // side of POS_SCALE (this account contributes one `bankrupt_side` leg).
+    let mut asset_rt = eng.mk[ai].engine.asset.try_to_runtime()?;
+    asset_rt.oi_eff_long_q = 2 * POS_SCALE;
+    asset_rt.oi_eff_short_q = 2 * POS_SCALE;
+    asset_rt.loss_weight_sum_long = 2 * POS_SCALE;
+    asset_rt.loss_weight_sum_short = 2 * POS_SCALE;
+    asset_rt.stored_pos_count_long = 2;
+    asset_rt.stored_pos_count_short = 2;
+    eng.mk[ai].engine.asset = AssetStateV16Account::from_runtime(&asset_rt);
+
+    // The leg on `bankrupt_side`, snapshot-bound to the asset's side state.
+    let (epoch_snap, k_snap, f_snap, b_snap) = match bankrupt_side {
+        SideV16::Long => (
+            asset_rt.epoch_long,
+            asset_rt.k_long,
+            asset_rt.f_long_num,
+            asset_rt.b_long_num,
+        ),
+        SideV16::Short => (
+            asset_rt.epoch_short,
+            asset_rt.k_short,
+            asset_rt.f_short_num,
+            asset_rt.b_short_num,
+        ),
+    };
+    let acct = &mut eng.accts[account as usize];
+    acct.legs[0] = PortfolioLegV16Account::from_runtime(&PortfolioLegV16 {
+        active: true,
+        asset_index: ai as u32,
+        market_id: asset_rt.market_id,
+        side: bankrupt_side,
+        basis_pos_q: POS_SCALE as i128,
+        a_basis: ADL_ONE,
+        k_snap,
+        f_snap,
+        epoch_snap,
+        loss_weight: POS_SCALE,
+        b_snap,
+        b_rem: 0,
+        b_epoch_snap: epoch_snap,
+        b_stale: false,
+        stale: false,
+    });
+    acct.active_bitmap[0] = V16PodU64::new(1);
+
+    // The finalized close-progress ledger: residual 0, `domain_side ==
+    // opposite_side(bankrupt_side)`. gross = support = junior_face_burned = 4 ⇒
+    // total_loss == progress == 4, residual == 0, finalized.
+    //
+    // `drift_reference_slot` is set to the group's `current_slot` (the activation
+    // slot) so the ADL entrypoint's snapshot-recovery gate
+    // (`ensure_open_close_snapshot_current_or_recovery`, v16.rs:9088) sees
+    // `current_slot <= drift_reference_slot` and does NOT declare permissionless
+    // recovery; `max_close_slot` stays at or above `current_slot` so the
+    // not-expired gate (v16.rs:9064) also passes, with `drift_reference_slot <=
+    // max_close_slot` (v16.rs:2301) preserved.
+    let current_slot = eng.mh.current_slot.get();
+    let max_close_slot = current_slot.saturating_add(10);
+    let ledger = CloseProgressLedgerV16 {
+        active: true,
+        finalized: true,
+        canceled: false,
+        close_id: 1,
+        asset_index: ai as u32,
+        market_id: asset_rt.market_id,
+        domain_side,
+        gross_loss_at_close_start: 4,
+        drift_reference_slot: current_slot,
+        max_close_slot,
+        support_consumed: 4,
+        junior_face_burned: 4,
+        insurance_spent: 0,
+        b_loss_booked: 0,
+        explicit_loss_assigned: 0,
+        quantity_adl_applied_q: 0,
+        drift_consumed: 0,
+        residual_remaining: 0,
+    };
+    acct.close_progress = CloseProgressLedgerV16Account::from_runtime(&ledger);
 
     // Only proceed from a state the engine itself accepts.
     let mv = MarketGroupV16ViewMut::new(&mut eng.mh, &mut eng.mk);
@@ -707,6 +961,44 @@ pub fn funded_liquidation_campaign() -> Scenario {
     }
 }
 
+/// A campaign that drives a REAL quantity-ADL: it seeds an engine-accepted,
+/// finalized-close, ADL-eligible state (via [`Action::SeedFinalizedClose`], which
+/// constructs the engine-validated finalized close-progress ledger plus an active
+/// `bankrupt_side` leg) and then applies a quantity-ADL of `POS_SCALE` against that
+/// leg. The ADL must close a non-zero quantity (`closed_q > 0`) on the profitable
+/// counterparty's open interest and advance the account's
+/// `close_progress.quantity_adl_applied_q` to that quantity — the non-vacuity the
+/// `tests/adl.rs` gate pins.
+///
+/// `bankrupt_side` is `Long` (`0`), so the deleveraged (profitable-counterparty)
+/// side is `Short`; `close_q == POS_SCALE` equals the seeded leg's
+/// `basis_pos_q.unsigned_abs()` and is below each side's `2 * POS_SCALE` open
+/// interest, so the ADL halves the opposite side's `a` (to `ADL_ONE / 2`) without
+/// driving either side to a full-drain reset.
+pub fn adl_campaign() -> Scenario {
+    use crate::scenario::Action::*;
+    Scenario {
+        n_markets: 1,
+        n_accounts: 1,
+        actions: vec![
+            // Construct the finalized-close, ADL-eligible state (bankrupt = long).
+            SeedFinalizedClose {
+                account: 0,
+                asset: 0,
+                bankrupt_side: 0,
+            },
+            // Apply the quantity-ADL: close the full POS_SCALE long leg, deleveraging
+            // the profitable short counterparty.
+            ApplyAdl {
+                account: 0,
+                asset: 0,
+                bankrupt_side: 0,
+                close_q: POS_SCALE,
+            },
+        ],
+    }
+}
+
 /// Execute a scenario, returning a [`Trace`] with one [`Observation`] per action.
 pub fn run(s: &Scenario) -> Trace {
     let mut eng = Engine::new(s.n_markets, s.n_accounts);
@@ -716,13 +1008,13 @@ pub fn run(s: &Scenario) -> Trace {
     let mut observations = Vec::with_capacity(s.actions.len());
 
     for (step, action) in s.actions.iter().enumerate() {
-        // `apply` returns the liquidation outcome on a successful liquidation;
-        // split it from the `Result` recorded on the observation.
-        let (result, liquidation) =
-            match apply(&mut eng, *action, &mut external_in, &mut external_out) {
-                Ok(liq) => (Ok(()), liq),
-                Err(e) => (Err(format!("{e:?}")), None),
-            };
+        // `apply` returns the liquidation and/or ADL outcome on a successful step;
+        // split them from the `Result` recorded on the observation.
+        let (result, outcome) = match apply(&mut eng, *action, &mut external_in, &mut external_out)
+        {
+            Ok(out) => (Ok(()), out),
+            Err(e) => (Err(format!("{e:?}")), StepOutcome::default()),
+        };
         // Views from apply() are out of scope here; safe to read account and
         // market-engine state.
         let accounts = eng.observe();
@@ -733,7 +1025,8 @@ pub fn run(s: &Scenario) -> Trace {
             result,
             accounts,
             market_domains,
-            liquidation,
+            liquidation: outcome.liquidation,
+            adl: outcome.adl,
         });
     }
 

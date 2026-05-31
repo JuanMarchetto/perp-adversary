@@ -27,6 +27,17 @@ fn scenario_roundtrips_through_json() {
                 account: 0,
                 amount: 500,
             },
+            Action::SeedFinalizedClose {
+                account: 0,
+                asset: 0,
+                bankrupt_side: 0,
+            },
+            Action::ApplyAdl {
+                account: 0,
+                asset: 0,
+                bankrupt_side: 0,
+                close_q: 1_000_000,
+            },
         ],
     };
     let j = serde_json::to_string(&s).unwrap();
