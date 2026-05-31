@@ -1228,19 +1228,25 @@ pub fn earned_lien_campaign() -> Scenario {
 /// `permissionless_crank` (`settle_leg_kf_effects_at_slot`, `v16.rs:7179`).
 ///
 /// When `size_q` is NOT a whole multiple of `POS_SCALE` (a fractional basis), the
-/// per-leg settlement magnitude `funding_delta * |basis| / (a_basis * POS_SCALE)`
-/// has a nonzero remainder, so `floor_div_signed_conservative_i128`
-/// (`wide_math.rs:1433-1447`) truncates the RECEIVER's gain to `q` (`net > 0` branch,
-/// `v16.rs:7194-7197`) while rounding the PAYER's loss to `q+1` (`net < 0` branch,
-/// `v16.rs:7198-7208`, whose `reserve_new_capital_backed_loss` debits capital by the
-/// rounded magnitude, `v16.rs:6998`/`7028`). Because the two legs settle in separate
-/// instructions, no per-instruction `TokenValueFlowProof` spans both, so the
-/// asymmetry is never caught: each settled slot permanently destroys exactly one
-/// quote atom of claimable value (`Σ capital + Σ pnl`) with the vault flat and the
-/// dust credited to NO sink — violating spec req #14 (the
-/// `SettlementRoundingResidue`/`UnallocatedProtocolSurplus` sink fields do not exist
-/// in the live `MarketGroupV16HeaderAccount`, `v16.rs:4057-4091`) and undetectable at
-/// runtime (`StockReconciliationProofV16`, `v16.rs:3019`, is never constructed).
+/// per-leg settled magnitude has a nonzero remainder. `leg_kf_delta_for_settlement`
+/// (`v16.rs:7129`) floors it toward −∞ — via the fast path `scaled_adl_delta_fast`
+/// (`v16.rs:12557` -> `floor_div_signed_conservative_i128` at `:12572`) when
+/// `a_basis == ADL_ONE`, else `wide_signed_mul_div_floor_from_k_pair`
+/// (`wide_math.rs:1630`, at `v16.rs:7143`/`:7157`); both round identically. The
+/// RECEIVER's positive direction truncates to `⌊x⌋`, the PAYER's same-magnitude
+/// negative direction rounds up to `⌈x⌉`. Both legs apply that `net` to PnL via
+/// `apply_signed_kf_delta_to_pnl` — the receiver's PnL `+⌊x⌋` (`v16.rs:7197`), the
+/// payer's PnL `−⌈x⌉` (`:7200`). Because
+/// the two legs settle in separate instructions, no per-instruction
+/// `TokenValueFlowProof` spans both, so the asymmetry is never caught: each settled
+/// slot permanently destroys exactly one quote atom of claimable value
+/// (`Σ capital + Σ pnl`) with the vault flat and the dust credited to NO sink —
+/// violating spec req #14 (the `SettlementRoundingResidue`/`UnallocatedProtocolSurplus`
+/// sink fields do not exist in the live `MarketGroupV16HeaderAccount`,
+/// `v16.rs:4057-4091`) and undetectable at runtime (`StockReconciliationProofV16`,
+/// `v16.rs:3019`, is never constructed). (A capital-backed-loss reservation may follow
+/// on the payer leg, `v16.rs:6998`, but it only reclassifies part of the PnL loss into
+/// capital and does not change the claimable total.)
 ///
 /// A whole-multiple `size_q` (no remainder) conserves claimable value exactly — the
 /// `tests/funding_conservation.rs` causation arm pins clean-vs-fractional. The

@@ -1279,19 +1279,25 @@ pub fn check_step_value_conservation(
 //
 // The engine breaks this by a FLOOR/CEIL ASYMMETRY. The two legs of a matched
 // position settle their funding K/F deltas in SEPARATE `permissionless_crank`
-// instructions (`settle_leg_kf_effects_at_slot`, `v16.rs:7179`):
-//   * the RECEIVER leg (`net > 0`, `v16.rs:7194-7197`) credits PnL by
-//     `floor_div_signed_conservative_i128(+x) = ⌊x⌋ = q` (truncates down,
-//     `wide_math.rs:1435`);
-//   * the PAYER leg (`net < 0`, `v16.rs:7198-7208`) debits CAPITAL by
-//     `|floor_div_signed_conservative_i128(−x)| = ⌈x⌉ = q+1` (rounds away from
-//     zero, `wide_math.rs:1441`) via `reserve_new_capital_backed_loss` (`v16.rs:6998`,
-//     `c_tot -= q+1` at `:7028`).
-// When the per-leg magnitude `x = funding_delta·|basis| / (a_basis·POS_SCALE)` has a
-// nonzero remainder (a FRACTIONAL basis), `⌈x⌉ − ⌊x⌋ = 1`: the payer loses one MORE
-// atom than the receiver gains. `M` falls by exactly 1 per settled slot. The vault
-// is UNTOUCHED (funding moves no tokens), so the destroyed atom becomes permanent,
-// unattributable vault slack.
+// instructions (`settle_leg_kf_effects_at_slot`, `v16.rs:7179`). Each leg's settled
+// `net` is computed and floored toward −∞ in `leg_kf_delta_for_settlement`
+// (`v16.rs:7129`) by `wide_signed_mul_div_floor_from_k_pair` (`wide_math.rs:1630`,
+// called at `v16.rs:7143`/`:7157`): the positive direction truncates to `⌊x⌋`
+// (`wide_math.rs:1667`), the negative direction rounds the magnitude up to `⌈x⌉`
+// (`wide_math.rs:1654-1666`). (The fast path `scaled_adl_delta_fast`, `v16.rs:12557`,
+// floors identically via `floor_div_signed_conservative_i128` at `:12572` when
+// `a_basis == ADL_ONE`.) The two legs share the same `|basis_pos_q|` (`v16.rs:7140`/
+// `:7154`) and an equal-and-opposite K/F delta, so they settle the SAME magnitude `x`
+// with opposite sign. Both apply `net` to PnL via `apply_signed_kf_delta_to_pnl`:
+//   * the RECEIVER leg (`net > 0`, `v16.rs:7197`) credits PnL by `⌊x⌋`;
+//   * the PAYER leg   (`net < 0`, `v16.rs:7200`) debits PnL by `⌈x⌉`.
+// When `x` has a nonzero remainder (a FRACTIONAL basis — `size_q` not a whole
+// multiple of `POS_SCALE`), `⌈x⌉ − ⌊x⌋ = 1`: the payer loses one MORE atom than the
+// receiver gains, so `M` falls by exactly 1 per settled slot while the vault is
+// UNTOUCHED (funding moves no tokens) — the atom becomes permanent, unattributable
+// vault slack. (A capital-backed-loss reservation may follow on the payer leg,
+// `reserve_new_capital_backed_loss`, `v16.rs:6998`, but it only reclassifies part of
+// that PnL loss into capital and does NOT change `M`, so it is not part of the leak.)
 //
 // WHY THE ENGINE NEVER CATCHES IT:
 //   * No per-instruction `TokenValueFlowProof` spans BOTH legs (they settle in
