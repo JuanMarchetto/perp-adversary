@@ -1377,6 +1377,55 @@ pub fn convert_realization_campaign() -> Scenario {
     }
 }
 
+/// v0.8 — drive the residual liened-effective vs unliened-consume SEAM the
+/// extractive hunt flagged but could not execute. [`earned_lien_campaign`] draws a
+/// REAL source-credit lien (a risk-increasing add against earned funding PnL); this
+/// then FLATTENS the position and, **without releasing the lien when `release ==
+/// false`**, re-certifies and calls [`Action::ConvertReleasedPnl`].
+///
+/// The seam: `account_source_realizable_support` (`v16.rs:5728`) counts
+/// liened-effective support 1:1, but the realization consume
+/// (`create_and_consume_account_source_credit_for_effective_not_atomic`,
+/// `v16.rs:6204`) walks only `source_claim_unliened_num` — so converting while a lien
+/// is still reserved cannot be covered and is argued to fail closed (`LockActive`,
+/// `v16.rs:6249`). The flat account passes the exposure gate
+/// (`account_has_active_source_claim_exposure`, `v16.rs:8326`, which keys on open
+/// legs, not reserved liens), so the convert genuinely reaches the realizable path.
+///
+/// With `release == true` the lien is released first (`Action::ReleaseLiens`), so the
+/// convert succeeds and conserves claimable value exactly — the control proving the
+/// reserved lien is the blocker. Either way the convert NEVER mints (claimable value
+/// is conserved), so the seam holds — now tested, not argued.
+pub fn liened_seam_campaign(release: bool) -> Scenario {
+    use crate::scenario::Action::*;
+    let mut actions = earned_lien_campaign().actions;
+    // Flatten account 0's full long (100 + the 1.0 risk-increasing add).
+    actions.push(Trade {
+        long: 1,
+        short: 0,
+        asset: 0,
+        size_q: 101 * POS_SCALE,
+        exec_price: ACTIVATION_PRICE,
+        fee_bps: 0,
+    });
+    if release {
+        actions.push(ReleaseLiens { account: 0 });
+    }
+    // Re-certify at a fresh slot, then attempt to realize the released PnL.
+    actions.push(Crank {
+        account: 0,
+        asset: 0,
+        now_slot: 7,
+        effective_price: ACTIVATION_PRICE,
+    });
+    actions.push(ConvertReleasedPnl { account: 0 });
+    Scenario {
+        n_markets: 1,
+        n_accounts: 2,
+        actions,
+    }
+}
+
 /// A campaign that drives a REAL liquidation: it seeds an engine-accepted
 /// underwater position (via [`Action::SeedUnderwaterPosition`], which mirrors the
 /// engine's own `v16_public_liquidation_on_unfunded_domain_cannot_drain_shared_insurance`
