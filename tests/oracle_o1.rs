@@ -168,6 +168,9 @@ fn obs_with(domains: Vec<DomainObs>) -> Observation {
         market_domains: Vec::new(),
         liquidation: None,
         adl: None,
+        system: Default::default(),
+        ext_in_step: 0,
+        ext_out_step: 0,
     }
 }
 

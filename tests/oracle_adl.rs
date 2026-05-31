@@ -52,6 +52,9 @@ fn prev_obs(accounts: Vec<AccountObs>) -> Observation {
         market_domains: vec![],
         liquidation: None,
         adl: None,
+        system: Default::default(),
+        ext_in_step: 0,
+        ext_out_step: 0,
     }
 }
 
@@ -76,6 +79,9 @@ fn cur_obs(accounts: Vec<AccountObs>, closed_q: u128, applied_q: u128) -> Observ
             reset_started: false,
             quantity_adl_applied_q: applied_q,
         }),
+        system: Default::default(),
+        ext_in_step: 0,
+        ext_out_step: 0,
     }
 }
 
