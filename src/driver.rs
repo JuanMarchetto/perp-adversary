@@ -140,6 +140,63 @@ pub struct AdlObs {
     pub quantity_adl_applied_q: u128,
 }
 
+/// GROUP-HEADER quote-atom stores, read from the `MarketGroupV16HeaderAccount`
+/// (`percolator-ref/src/v16.rs:4057`) AFTER all engine views are dropped. These
+/// are the fields the v0.5 GLOBAL QUOTE-VALUE CONSERVATION oracle reasons over.
+///
+/// The authoritative quote-atom value model is the engine's own stock
+/// reconciliation (`spec.md` §5.1.1, line 1043; `StockReconciliationProofV16`,
+/// `v16.rs:3019`): the TOTAL real quote-atom balance held by the instance is the
+/// token vault, and it equals the sum of all partition stock classes
+/// (`token_vault == senior_capital_total + insurance_capital +
+/// backing_provider_earnings + settlement_rounding_residue_total +
+/// unallocated_protocol_surplus`, `v16.rs:3029-3041`). So `vault` IS
+/// `system_quote_value` — a single source-of-truth total, summed without any
+/// double-count. The remaining fields are surfaced for the oracle's partition
+/// CROSS-CHECK and for triage, not added on top of `vault`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SystemObs {
+    /// `header.vault` (`v16.rs:4061`) — the TOTAL real quote-atom balance of the
+    /// instance (the engine's `StockReconciliationProofV16.token_vault`,
+    /// `v16.rs:3020`). This is `system_quote_value(state)`: every other quote
+    /// store is a PARTITION of this total, so summing the parts would
+    /// double-count. The engine's `TokenValueFlowProof::validate` (`v16.rs:2913`)
+    /// proves `vault` changes by EXACTLY net external flow on every value-moving
+    /// instruction; the v0.5 oracle checks the EMERGENT composition of that across
+    /// a whole campaign at the harness level.
+    pub vault: u128,
+    /// `header.insurance` (`v16.rs:4062`) — `InsuranceCapital`, a partition class
+    /// of `vault` (`v16.rs:3022`). Surfaced for the partition cross-check, NOT
+    /// added on top of `vault`.
+    pub insurance: u128,
+    /// `header.c_tot` (`v16.rs:4063`) — `C_tot == sum(C_i)` (`spec.md:1072`): a
+    /// DERIVED aggregate of every account's `capital`, i.e. `SeniorCapital`, a
+    /// partition class of `vault`. It is NOT an independent store and is NOT added
+    /// on top of `vault` (doing so would double-count the per-account capital that
+    /// already sits inside `vault`).
+    pub c_tot: u128,
+    /// `header.payout_snapshot` (`v16.rs:4087`) — a SNAPSHOT of resolved-payout
+    /// entitlement captured at resolution, NOT a separate quote-atom store. It is
+    /// claim accounting (a record of what is owed), so it is observed for triage
+    /// but DELIBERATELY EXCLUDED from `system_quote_value`.
+    pub payout_snapshot: u128,
+    /// Sum over all asset slots of
+    /// `EngineAssetSlotV16Account::explicit_unallocated_loss_long/short`
+    /// (`v16.rs:3709`). This is LOSS ACCOUNTING — a record of loss that could not
+    /// be allocated — not a quote-atom store; the corresponding value class is
+    /// `ExplicitBackedLoss` (`spec.md:949`), tracked by `explicit_backed_loss_-
+    /// reserve_total`, which this simplified header does not separately carry.
+    /// Booking such loss does NOT move `vault`. Observed for triage, EXCLUDED from
+    /// the sum.
+    pub explicit_unallocated_loss_total: u128,
+    /// Sum over all asset slots of both sides'
+    /// `BackingDomainV16Account::utilization_fee_earnings` — the engine's
+    /// `backing_provider_earnings` stock class (`v16.rs:4508-4517`,
+    /// `StockReconciliationProofV16.backing_provider_earnings`, `v16.rs:3023`). A
+    /// partition class of `vault`. Surfaced for the partition cross-check only.
+    pub backing_provider_earnings: u128,
+}
+
 #[derive(Clone, Debug)]
 pub struct Observation {
     pub step: usize,
@@ -154,6 +211,18 @@ pub struct Observation {
     /// The `QuantityAdlOutcomeV16` captured when this step was an
     /// [`Action::ApplyAdl`] the engine accepted; `None` otherwise.
     pub adl: Option<AdlObs>,
+    /// GROUP-HEADER quote-atom stores for this post-step state (see [`SystemObs`]).
+    /// The v0.5 global quote-value conservation oracle reads `system.vault` here.
+    pub system: SystemObs,
+    /// The TOTAL external quote that flowed IN to the instance ON THIS STEP
+    /// (`deposit_not_atomic`, `v16.rs:11451`), i.e. the per-step delta of the
+    /// runner's cumulative `external_in`. `0` for any non-deposit step.
+    pub ext_in_step: u128,
+    /// The TOTAL external quote that flowed OUT of the instance ON THIS STEP
+    /// (`withdraw_not_atomic`, `v16.rs:11174`, and resolved-payout claims), i.e.
+    /// the per-step delta of the runner's cumulative `external_out`. `0` for any
+    /// non-withdraw step.
+    pub ext_out_step: u128,
 }
 
 #[derive(Clone, Debug)]
@@ -299,6 +368,34 @@ impl Engine {
             });
         }
         out
+    }
+
+    /// Read the GROUP-HEADER quote-atom stores (see [`SystemObs`]). MUST be called
+    /// after all engine views are dropped (same discipline as [`Engine::observe`]).
+    /// `vault`/`insurance`/`c_tot`/`payout_snapshot` come straight off the header
+    /// (`v16.rs:4061-4087`); `backing_provider_earnings` and
+    /// `explicit_unallocated_loss_total` are summed over the engine asset slots
+    /// exactly as the engine's stock reconciliation does (`v16.rs:4508-4517`).
+    fn observe_system(&self) -> SystemObs {
+        let mut backing_provider_earnings = 0u128;
+        let mut explicit_unallocated_loss_total = 0u128;
+        for market in self.mk.iter() {
+            let slot = &market.engine;
+            backing_provider_earnings = backing_provider_earnings
+                .saturating_add(slot.backing_long.utilization_fee_earnings.get())
+                .saturating_add(slot.backing_short.utilization_fee_earnings.get());
+            explicit_unallocated_loss_total = explicit_unallocated_loss_total
+                .saturating_add(slot.asset.explicit_unallocated_loss_long.get())
+                .saturating_add(slot.asset.explicit_unallocated_loss_short.get());
+        }
+        SystemObs {
+            vault: self.mh.vault.get(),
+            insurance: self.mh.insurance.get(),
+            c_tot: self.mh.c_tot.get(),
+            payout_snapshot: self.mh.payout_snapshot.get(),
+            explicit_unallocated_loss_total,
+            backing_provider_earnings,
+        }
     }
 }
 
@@ -568,7 +665,11 @@ fn apply(
             Ok(StepOutcome::default())
         }
         Action::SeedUnderwaterPosition { account, asset } => {
-            seed_underwater_position(eng, account, asset, 0)?;
+            // The seed injects `extra` quote atoms straight into the vault; record
+            // it as EXTERNAL INFLOW so the v0.5 conservation oracle treats this
+            // fixture deposit as an external flow, not a value mint.
+            let extra = seed_underwater_position(eng, account, asset, 0)?;
+            ext_in[account as usize] = ext_in[account as usize].saturating_add(extra);
             Ok(StepOutcome::default())
         }
         Action::SeedUnderwaterPositionFunded {
@@ -576,7 +677,8 @@ fn apply(
             asset,
             domain_budget,
         } => {
-            seed_underwater_position(eng, account, asset, domain_budget)?;
+            let extra = seed_underwater_position(eng, account, asset, domain_budget)?;
+            ext_in[account as usize] = ext_in[account as usize].saturating_add(extra);
             Ok(StepOutcome::default())
         }
         Action::Liquidate {
@@ -706,12 +808,20 @@ fn opposite_side(side: SideV16) -> SideV16 {
 /// `insurance` so that, post-funding, the group still satisfies
 /// `validate_shape`'s `senior <= vault` (v16.rs:4590) and
 /// `live_domain_budget_remaining_atoms <= insurance` (v16.rs:4594) invariants.
+///
+/// Returns the quote-atom amount `extra` injected into `vault` (and `insurance`).
+/// This is an EXTERNAL INFLOW of value into the instance — the seed deposits
+/// `extra` quote atoms straight into the vault via a direct field write rather
+/// than through `deposit_not_atomic`, but it is value crossing the instance
+/// boundary all the same. The call site MUST record it in the runner's external
+/// inflow ledger so the v0.5 conservation oracle does not mistake this fixture
+/// deposit for a value mint.
 fn seed_underwater_position(
     eng: &mut Engine,
     account: u8,
     asset: u8,
     domain_budget: u128,
-) -> Result<(), V16Error> {
+) -> Result<u128, V16Error> {
     let ai = asset as usize;
 
     // Group-header bookkeeping the underwater leg requires. The base 50 mirrors
@@ -777,7 +887,7 @@ fn seed_underwater_position(
         &mut eng.domains[account as usize],
     );
     av.validate_with_market(&mv.as_view())?;
-    Ok(())
+    Ok(extra)
 }
 
 /// Drive `account` into an engine-accepted, FINALIZED-CLOSE, ADL-eligible state on
@@ -1216,6 +1326,11 @@ pub fn run(s: &Scenario) -> Trace {
     let mut observations = Vec::with_capacity(s.actions.len());
 
     for (step, action) in s.actions.iter().enumerate() {
+        // Snapshot the cumulative external-flow totals BEFORE the step so the
+        // per-step delta (the only external value that crosses the instance
+        // boundary this step) can be recovered for the conservation oracle.
+        let in_before: u128 = external_in.iter().copied().sum();
+        let out_before: u128 = external_out.iter().copied().sum();
         // `apply` returns the liquidation and/or ADL outcome on a successful step;
         // split them from the `Result` recorded on the observation.
         let (result, outcome) = match apply(&mut eng, *action, &mut external_in, &mut external_out)
@@ -1223,10 +1338,13 @@ pub fn run(s: &Scenario) -> Trace {
             Ok(out) => (Ok(()), out),
             Err(e) => (Err(format!("{e:?}")), StepOutcome::default()),
         };
-        // Views from apply() are out of scope here; safe to read account and
-        // market-engine state.
+        // Views from apply() are out of scope here; safe to read account,
+        // market-engine, and group-header state.
         let accounts = eng.observe();
         let market_domains = eng.observe_markets();
+        let system = eng.observe_system();
+        let in_after: u128 = external_in.iter().copied().sum();
+        let out_after: u128 = external_out.iter().copied().sum();
         observations.push(Observation {
             step,
             action: *action,
@@ -1235,6 +1353,9 @@ pub fn run(s: &Scenario) -> Trace {
             market_domains,
             liquidation: outcome.liquidation,
             adl: outcome.adl,
+            system,
+            ext_in_step: in_after.saturating_sub(in_before),
+            ext_out_step: out_after.saturating_sub(out_before),
         });
     }
 

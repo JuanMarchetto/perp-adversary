@@ -1,5 +1,7 @@
 use perp_adversary::driver::run;
-use perp_adversary::oracles::{check_observation, check_observation_market};
+use perp_adversary::oracles::{
+    check_observation, check_observation_market, check_step_value_conservation,
+};
 use perp_adversary::runner::{first_violation, OracleFn};
 use perp_adversary::scenario::{Action, Scenario};
 use proptest::prelude::*;
@@ -84,6 +86,23 @@ proptest! {
                 let _ = std::fs::write(path, serde_json::to_string_pretty(&s).unwrap());
                 panic!("CROSS-LINK CANDIDATE at step {}: {} :: saved {} :: scenario={}",
                     obs.step, v.detail, path, serde_json::to_string(&s).unwrap());
+            }
+        }
+
+        // v0.5 GLOBAL QUOTE-VALUE CONSERVATION (EMERGENT, engine-unchecked): over
+        // every consecutive (prev, cur) pair, the total real quote-atom balance
+        // (`system.vault`) must change by EXACTLY the per-step net external flow.
+        // Unlike the two checks above (conformance mirrors of engine validators),
+        // a breach here is a value LEAK/MINT CANDIDATE — persist and surface; NEVER
+        // weaken the oracle to pass.
+        for pair in trace.observations.windows(2) {
+            let (prev, cur) = (&pair[0], &pair[1]);
+            if let Err(v) = check_step_value_conservation(prev, cur) {
+                let _ = std::fs::create_dir_all("scenarios");
+                let path = "scenarios/conservation_candidate.json";
+                let _ = std::fs::write(path, serde_json::to_string_pretty(&s).unwrap());
+                panic!("CONSERVATION CANDIDATE at step {}: {} :: saved {} :: scenario={}",
+                    cur.step, v.detail, path, serde_json::to_string(&s).unwrap());
             }
         }
     }

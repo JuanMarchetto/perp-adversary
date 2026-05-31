@@ -63,7 +63,7 @@
 //! exhausts the model checker's memory). The public [`realizability`] wraps it,
 //! constructing a human-readable [`Violation`] only on the error path.
 
-use crate::driver::{AccountObs, AdlObs, DomainObs, MarketSideObs, Observation};
+use crate::driver::{AccountObs, AdlObs, DomainObs, MarketSideObs, Observation, SystemObs};
 use crate::scenario::Action;
 
 /// `BOUND_SCALE` / `CREDIT_RATE_SCALE` from `percolator-ref/src/lib.rs:25-26`.
@@ -982,4 +982,287 @@ fn describe_adl(
 /// a trace's observations.
 pub fn check_step_adl_accounting(prev: &Observation, cur: &Observation) -> Result<(), Violation> {
     adl_accounting(prev, cur)
+}
+
+// =============================================================================
+// v0.5 — GLOBAL QUOTE-VALUE CONSERVATION (an EMERGENT, engine-UNCHECKED invariant)
+// =============================================================================
+//
+// THIS ORACLE IS DIFFERENT IN KIND FROM EVERY ORACLE ABOVE.
+//
+// The O1 / cross-link / isolation / ADL-accounting oracles each MIRROR a
+// per-state or per-instruction validator the engine ITSELF runs on every accepted
+// state (`SourceCreditLienAggregateProofV16::validate`, the ADL ledger advance,
+// etc.). Because the engine rejects any state that would break them, those oracles
+// hold on every engine-accepted state by construction — they are CONFORMANCE
+// checks, and a green result is (correctly) vacuous as a bug signal.
+//
+// This oracle checks an EMERGENT property the engine does NOT enforce as a single
+// global validator across a whole campaign: total real quote-atom value is
+// CONSERVED over an entire multi-instruction campaign, changing only by external
+// flows. The engine proves a LOCAL version per instruction
+// (`TokenValueFlowProofV16::validate`, `v16.rs:2913-2942`, enforces
+// `vault_after - vault_before == external_quote_in - external_quote_out` on each
+// value-moving instruction). This oracle composes that across the WHOLE campaign,
+// at the HARNESS level, from independently observed post-step `vault` snapshots —
+// no engine proof object is consulted. A value LEAK or MINT — quote atoms created
+// or destroyed across an internal step beyond the external flow — would be the
+// most serious class of DeFi bug. So unlike the conformance oracles, a green
+// result here is a genuine (non-vacuous) independent signal, and a RED result is a
+// CANDIDATE that must be TRIAGED (real leak vs incomplete value model), never a
+// confirmed bug on its own.
+//
+// ## The value model (spec.md §5.1.1 + `StockReconciliationProofV16`)
+//
+// Per spec req #13 (`spec.md:46`) quote-value conservation is over QUOTE ATOMS
+// ONLY; "encumbrances, source-credit reservations, backing buckets, and liens are
+// not value classes". Per req #14 (`spec.md:47`) rounding residue has explicit
+// sinks. So PnL, claims, liens, backing, and reservations are ACCOUNTING OF CLAIMS,
+// not real value.
+//
+// The engine's own stock reconciliation (`spec.md:1043`,
+// `StockReconciliationProofV16::validate`, `v16.rs:3029-3041`) is the authoritative
+// quote-atom value model. It proves the TOTAL real quote-atom balance is the token
+// vault, and that vault equals the sum of all PARTITION stock classes:
+//
+//     token_vault == senior_capital_total    (== C_tot == Σ account capital)
+//                  + insurance_capital
+//                  + backing_provider_earnings
+//                  + settlement_rounding_residue_total
+//                  + unallocated_protocol_surplus
+//
+// Therefore `system_quote_value(state) == vault`. `vault` is the single
+// source-of-truth total real quote-atom store; every other quote store is a SLICE
+// of it. We deliberately do NOT sum the slices: doing so would DOUBLE-COUNT (e.g.
+// `c_tot == Σ capital`, `spec.md:1072`, is a derived aggregate of value already
+// inside `vault`).
+//
+// EXCLUDED from the sum (and WHY):
+//   * `pnl`, `pnl_pos_tot`, `pnl_*_bound_*` (`v16.rs:4064-4067`): unrealized/claim
+//     accounting, NOT a value class (`spec.md:961-972`).
+//   * `payout_snapshot` (`v16.rs:4087`): a SNAPSHOT of payout entitlement, claim
+//     accounting, not a separate quote-atom store.
+//   * `explicit_unallocated_loss_*` (`v16.rs:3709`): LOSS accounting; the value
+//     class `ExplicitBackedLoss` (`spec.md:949`) already lives inside `vault`.
+//   * `c_tot`, `insurance`, `backing_provider_earnings`: PARTITIONS of `vault`,
+//     so adding them on top of `vault` would double-count. (They are surfaced for
+//     the optional partition cross-check below, not added to the measure.)
+//
+// ## External flow in the harness
+//
+// The ONLY value that crosses the instance boundary in any campaign is `Deposit`
+// (`deposit_not_atomic`, external_in) and `Withdraw` (`withdraw_not_atomic`,
+// external_out). No campaign invokes `resolve_market` or
+// `claim_resolved_payout_topup` (no such `Action`), so there is no external
+// insurance payout or fee leaving the system on any step. The fixture seed
+// `seed_underwater_position` injects quote atoms straight into `vault`; the driver
+// records that injection as external_in (see `driver.rs`), so it too is an honest
+// external flow, not a mint. Consequently, EVERY internal step (trade, price move,
+// crank, liquidation, ADL, lien op, finalize-close, ...) MUST net EXACTLY ZERO
+// vault change: `Δvault == ext_in_delta − ext_out_delta`.
+
+/// Which conservation invariant was broken across a step.  `Copy` and
+/// allocation-free so the soundness proof can reason about the predicate without
+/// modelling string formatting (same discipline as [`ViolationKind`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConservationKind {
+    /// `vault` ROSE across the step by MORE than the net external inflow — quote
+    /// atoms appeared from nowhere (a value MINT candidate), or the value model is
+    /// missing a store that legitimately grew.
+    ValueAppeared,
+    /// `vault` FELL across the step by MORE than the net external outflow — quote
+    /// atoms vanished (a value LEAK candidate), or the value model is missing a
+    /// store that legitimately shrank / a value that legitimately left.
+    ValueDisappeared,
+    /// The engine's own stock-reconciliation partition is violated in the observed
+    /// post-step state: the senior + insurance + backing slices EXCEED `vault`
+    /// (`senior <= vault`, `v16.rs:4590`). This means the observed value model is
+    /// internally inconsistent and the conservation result cannot be trusted —
+    /// fail closed rather than certify a possibly-incomplete measure.
+    PartitionExceedsVault,
+}
+
+impl ConservationKind {
+    /// The spec/engine citation this breaks.
+    pub fn requirement(self) -> &'static str {
+        match self {
+            ConservationKind::ValueAppeared | ConservationKind::ValueDisappeared => {
+                "quote-value conservation (spec.md:46 req#13; v16.rs:2913 TokenValueFlowProof)"
+            }
+            ConservationKind::PartitionExceedsVault => {
+                "stock reconciliation partition (spec.md:1043; v16.rs:4590 senior<=vault)"
+            }
+        }
+    }
+}
+
+/// GLOBAL QUOTE-VALUE CONSERVATION arithmetic core: allocation-free, pure,
+/// fail-closed.  Given the pre-step total quote-atom balance `prev_vault`
+/// (`prev.system.vault`), the post-step balance `cur_vault` (`cur.system.vault`),
+/// and the per-step external flow deltas `ext_in_delta` / `ext_out_delta`, returns
+/// `Ok(())` iff
+///
+/// ```text
+/// cur_vault − prev_vault == ext_in_delta − ext_out_delta
+/// ```
+///
+/// i.e. the TOTAL real quote-atom balance changed by EXACTLY the net external flow.
+/// `partition_sum` is the engine's senior+insurance+backing partition of the
+/// post-step vault (`c_tot + insurance + backing_provider_earnings`,
+/// `v16.rs:4583-4589`); if it EXCEEDS `cur_vault` the value model is internally
+/// inconsistent and we fail closed.
+///
+/// Reasoned about by the companion Kani proof. It compares the two SIGNED-SAFE
+/// sides of the equation via `u128` checked arithmetic, never forming an
+/// intermediate that could overflow or wrap to mask a breach: it tests the
+/// equality `prev_vault + ext_in_delta == cur_vault + ext_out_delta` (every term a
+/// non-negative `u128`, the only widening being two checked additions), which is
+/// algebraically identical to the displayed equation but cannot underflow.
+#[inline]
+pub fn value_conservation_kind(
+    prev_vault: u128,
+    cur_vault: u128,
+    ext_in_delta: u128,
+    ext_out_delta: u128,
+    partition_sum: u128,
+) -> Result<(), ConservationKind> {
+    // The observed value model must be internally consistent: the engine's own
+    // senior+insurance+backing partition can never exceed the total vault
+    // (`senior <= vault`, v16.rs:4590). If it does, the measure is untrustworthy;
+    // fail closed rather than certify conservation against a broken partition.
+    if partition_sum > cur_vault {
+        return Err(ConservationKind::PartitionExceedsVault);
+    }
+
+    // Balance the conservation equation as `prev_vault + ext_in == cur_vault +
+    // ext_out`. Both sides are sums of non-negative u128 atoms; using checked_add
+    // means an overflow (impossible within the engine's bounded vault, but proven
+    // safe rather than assumed) fails closed instead of wrapping. Splitting the
+    // comparison by which side is larger lets us name the breach direction
+    // precisely without ever forming a negative intermediate.
+    let lhs = prev_vault.checked_add(ext_in_delta);
+    let rhs = cur_vault.checked_add(ext_out_delta);
+    match (lhs, rhs) {
+        (Some(l), Some(r)) if l == r => Ok(()),
+        // lhs < rhs  ⇒  cur_vault + ext_out > prev_vault + ext_in
+        //           ⇒  Δvault > ext_in − ext_out: value APPEARED beyond the inflow.
+        (Some(l), Some(r)) if l < r => Err(ConservationKind::ValueAppeared),
+        // lhs > rhs  ⇒  Δvault < ext_in − ext_out: value DISAPPEARED beyond outflow.
+        (Some(l), Some(r)) if l > r => Err(ConservationKind::ValueDisappeared),
+        // An addition overflowed (cannot happen for a real bounded vault). Fail
+        // closed to the worst case: treat as value appearing.
+        _ => Err(ConservationKind::ValueAppeared),
+    }
+}
+
+/// v0.5 GLOBAL QUOTE-VALUE CONSERVATION oracle: for a consecutive `(prev, cur)`
+/// observation pair, check that the instance's TOTAL real quote-atom balance
+/// (`system.vault`, the engine's `StockReconciliationProofV16.token_vault`) changed
+/// by EXACTLY the net external flow that crossed the boundary on this step.
+///
+/// `ext_in_delta` / `ext_out_delta` are the per-step external inflow / outflow
+/// (the runner records them on the observation as `cur.ext_in_step` /
+/// `cur.ext_out_step`; the public [`check_step_value_conservation`] wires them in).
+/// For an INTERNAL step (no deposit / withdraw) both are 0, so the vault MUST be
+/// unchanged.
+///
+/// This is an EMERGENT invariant the engine does NOT enforce globally (see the
+/// module banner above): a green result is a genuine independent conservation
+/// signal, and a RED result is a CANDIDATE to be TRIAGED, not a confirmed bug.
+/// Pure and fail-closed; wraps [`value_conservation_kind`], adding a human-readable
+/// detail only on the error path.
+pub fn value_conservation(
+    prev: &Observation,
+    cur: &Observation,
+    ext_in_delta: u128,
+    ext_out_delta: u128,
+) -> Result<(), Violation> {
+    let prev_vault = prev.system.vault;
+    let cur_vault = cur.system.vault;
+    let partition_sum = partition_sum(&cur.system);
+    value_conservation_kind(
+        prev_vault,
+        cur_vault,
+        ext_in_delta,
+        ext_out_delta,
+        partition_sum,
+    )
+    .map_err(|kind| Violation {
+        requirement: kind.requirement(),
+        detail: describe_conservation(
+            kind,
+            prev_vault,
+            cur_vault,
+            ext_in_delta,
+            ext_out_delta,
+            &cur.system,
+        ),
+    })
+}
+
+/// The engine's senior+insurance+backing partition of the vault in the observed
+/// post-step state: `c_tot + insurance + backing_provider_earnings`
+/// (`v16.rs:4583-4589`). Saturating (the values are real engine quantities and the
+/// sum is only used for a `>`-comparison; saturation can only ever make the
+/// cross-check STRICTER, never hide a breach).
+#[inline]
+fn partition_sum(s: &SystemObs) -> u128 {
+    s.c_tot
+        .saturating_add(s.insurance)
+        .saturating_add(s.backing_provider_earnings)
+}
+
+/// Build the human-readable detail for a [`ConservationKind`]. Only ever called on
+/// the error path, so its `format!` allocations stay off the model-checked core.
+fn describe_conservation(
+    kind: ConservationKind,
+    prev_vault: u128,
+    cur_vault: u128,
+    ext_in_delta: u128,
+    ext_out_delta: u128,
+    s: &SystemObs,
+) -> String {
+    match kind {
+        ConservationKind::ValueAppeared => format!(
+            "vault {prev_vault} -> {cur_vault} (Δ +{}) but net external flow was \
+             +{ext_in_delta}/-{ext_out_delta} (net {}): {} quote atoms APPEARED beyond the \
+             external flow. Triage: is this a value store excluded from the model that legitimately \
+             grew (c_tot={}, insurance={}, backing_earnings={}), or a genuine MINT?",
+            cur_vault.wrapping_sub(prev_vault),
+            (ext_in_delta as i128) - (ext_out_delta as i128),
+            (cur_vault.wrapping_sub(prev_vault)).wrapping_sub(ext_in_delta.wrapping_sub(ext_out_delta)),
+            s.c_tot,
+            s.insurance,
+            s.backing_provider_earnings,
+        ),
+        ConservationKind::ValueDisappeared => format!(
+            "vault {prev_vault} -> {cur_vault} (Δ -{}) but net external flow was \
+             +{ext_in_delta}/-{ext_out_delta} (net {}): quote atoms DISAPPEARED beyond the \
+             external flow. Triage: did value legitimately LEAVE (external payout/fee) unaccounted, \
+             or is this a genuine LEAK?",
+            prev_vault.wrapping_sub(cur_vault),
+            (ext_in_delta as i128) - (ext_out_delta as i128),
+        ),
+        ConservationKind::PartitionExceedsVault => format!(
+            "post-step partition c_tot({}) + insurance({}) + backing_earnings({}) = {} EXCEEDS \
+             vault({cur_vault}): the engine's own senior<=vault invariant (v16.rs:4590) is \
+             violated in the observed state, so the conservation measure is untrustworthy",
+            s.c_tot,
+            s.insurance,
+            s.backing_provider_earnings,
+            partition_sum(s),
+        ),
+    }
+}
+
+/// Run [`value_conservation`] over a consecutive `(prev, cur)` observation pair,
+/// taking the per-step external flow deltas straight off `cur` (the runner records
+/// them there). A thin convenience over the pair-wise oracle so a cross-step runner
+/// can fold the v0.5 conservation check across a trace's observations exactly like
+/// the other `check_step_*` helpers.
+pub fn check_step_value_conservation(
+    prev: &Observation,
+    cur: &Observation,
+) -> Result<(), Violation> {
+    value_conservation(prev, cur, cur.ext_in_step, cur.ext_out_step)
 }

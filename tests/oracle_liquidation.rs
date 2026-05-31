@@ -71,6 +71,9 @@ fn obs(market_domains: Vec<MarketSideObs>, liq: Option<(u8, LiquidationObs)>) ->
         market_domains,
         liquidation,
         adl: None,
+        system: Default::default(),
+        ext_in_step: 0,
+        ext_out_step: 0,
     }
 }
 
