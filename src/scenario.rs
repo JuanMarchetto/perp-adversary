@@ -226,6 +226,31 @@ pub enum Action {
         bankrupt_side: u8,
         close_q: u128,
     },
+    /// v0.7 — REALIZE released positive PnL into withdrawable capital via the
+    /// engine's PUBLIC `convert_released_pnl_to_capital_not_atomic` (`v16.rs:10821`).
+    /// This is the ONLY path that turns PnL (claim accounting) into `capital` (a real,
+    /// withdrawable value class); `withdraw_not_atomic` only pays from `capital`
+    /// (`v16.rs:11140`). It was the engine's unwired PnL-realization surface — the
+    /// gate behind which every "winner overdraws realizable PnL" extraction theory
+    /// dead-ended. Wiring it lets the harness FUZZ the backing firewall
+    /// (`create_and_consume_account_source_credit_for_effective_not_atomic`,
+    /// `v16.rs:6185`) against the v0.6 claimable-value oracle: convert does
+    /// `capital += converted`, `pnl -= face_burn` with the vault flat, so a mint
+    /// (`converted > face_burn`) would surface as `ClaimableValueCreated` (the
+    /// extractive direction). The engine is argued to round `face_burn >= converted`
+    /// (rate <= 1) and to fail closed (`LockActive`, `v16.rs:6249`) on the
+    /// liened-effective vs unliened-consume seam; this exercises that argument.
+    ConvertReleasedPnl {
+        account: u8,
+    },
+    /// v0.7 — release an account's no-longer-needed source-credit liens via the
+    /// engine's PUBLIC `release_account_source_credit_liens_if_unneeded_not_atomic`
+    /// (`v16.rs:10834`), so a lien drawn while a position was open can be released
+    /// after the position is flat — the setup for driving a CONVERT against a flat
+    /// account that still carries liened-effective support (the residual seam).
+    ReleaseLiens {
+        account: u8,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -374,6 +399,9 @@ impl Scenario {
                     check_acc(i, account, "")?;
                     check_asset(i, asset, "")?;
                     check_side(i, bankrupt_side)?;
+                }
+                Action::ConvertReleasedPnl { account } | Action::ReleaseLiens { account } => {
+                    check_acc(i, account, "")?;
                 }
             }
         }
